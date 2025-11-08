@@ -18,7 +18,7 @@ This document lays out an incremental delivery roadmap that keeps extension cont
   - Updated documentation covering architecture overview, coding conventions, and environment variable usage for AI providers.
   - Base utility modules (`src/core/logger.ts`, `src/shared/types.ts`) and messaging helpers wired between popup, background, and content scripts.
   - Initial IndexedDB bootstrap (`src/storage/indexedDb.ts`) with version management stubs and smoke tests.
-- **Exit Criteria**
+  - Storage schema reference (`docs/storage.md`) outlining IndexedDB stores and fallbacks.
   - `bun dev` and `bun run build` succeed without warnings; lint/test automation exists even if minimal.
   - Team alignment captured on storage choices, AI configuration flow, and security/privacy guardrails.
 

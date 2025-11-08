@@ -17,6 +17,18 @@ export interface GeneratedScriptPayload {
   urlMatchPattern?: string;
 }
 
+export interface TemporaryScript {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  selector: string;
+  context: PageContextSnapshot;
+  script: GeneratedScriptPayload;
+  status: 'pending' | 'applied' | 'failed';
+  errorMessage?: string;
+  notes?: string;
+}
+
 export interface ScriptMetadata {
   id: string;
   createdAt: number;
@@ -26,10 +38,23 @@ export interface ScriptMetadata {
   status: 'draft' | 'active' | 'disabled';
 }
 
+export type SettingKey = 'aiProviderConfig';
+
+export interface StoredSetting<TValue> {
+  key: SettingKey;
+  value: TValue;
+  updatedAt: number;
+}
+
 export interface AiProviderConfig {
   baseUrl: string;
   apiKey: string | null;
   model: string;
+}
+
+export interface CapturedSelectorState {
+  descriptor: SelectorDescriptor;
+  context: PageContextSnapshot;
 }
 
 export interface RuntimeMessage<TType extends string, TPayload> {

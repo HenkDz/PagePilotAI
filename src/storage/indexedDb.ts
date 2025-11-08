@@ -14,6 +14,8 @@ let dbPromise: Promise<IDBDatabase> | null = null;
 
 const log = logger.child('indexed-db');
 
+export const isIndexedDbAvailable = (): boolean => 'indexedDB' in globalThis;
+
 const openDatabase = async (): Promise<IDBDatabase> => {
   if (!('indexedDB' in globalThis)) {
     throw new Error('IndexedDB is not available in this environment.');
@@ -109,7 +111,7 @@ export const withStore = async <TReturn>(
 };
 
 export const clearDatabase = async () => {
-  if (!('indexedDB' in globalThis)) {
+  if (!isIndexedDbAvailable()) {
     return;
   }
 
@@ -123,4 +125,11 @@ export const clearDatabase = async () => {
   });
 
   dbPromise = null;
+};
+
+export const requestToPromise = <T>(request: IDBRequest<T>): Promise<T> => {
+  return new Promise<T>((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed.'));
+  });
 };
