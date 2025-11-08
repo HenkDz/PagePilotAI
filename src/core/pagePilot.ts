@@ -1,5 +1,9 @@
+import { RuntimeMessageType } from '../shared/messages';
 import { logger } from './logger';
 import type { TemporaryScript } from '../shared/types';
+import type { RuntimeResponse } from '../shared/types';
+import type { TempScriptModuleCreateResult } from '../shared/messages';
+type BrowserApi = typeof import('webextension-polyfill');
 
 type CleanupHandler = () => void | Promise<void>;
 
@@ -14,6 +18,8 @@ const log = logger.child('page-pilot');
 
 const previews = new Map<string, PreviewEntry>();
 
+const browserApi: BrowserApi | undefined = (globalThis as typeof globalThis & { browser?: BrowserApi }).browser;
+
 const attachStyle = (id: string, cssCode: string | undefined): HTMLStyleElement | undefined => {
   if (!cssCode) {
     return undefined;
@@ -27,16 +33,21 @@ const attachStyle = (id: string, cssCode: string | undefined): HTMLStyleElement 
   return style;
 };
 
-const loadModuleRunner = async (source: string): Promise<(context: unknown) => unknown> => {
-  if (typeof URL.createObjectURL !== 'function' || typeof Blob === 'undefined') {
-    // Fallback for environments (like unit tests) that do not expose blob URLs.
-    const legacyRunner = new Function('context', `'use strict';\n${source}`);
-    return async (context: unknown) => legacyRunner(context);
+const fetchRemoteModule = async (scriptId: string, source: string) => {
+  if (typeof browserApi?.runtime?.sendMessage !== 'function') {
+    throw new Error('Extension messaging unavailable for module creation.');
   }
 
-  const moduleSource = `export default async (context) => {\n${source}\n};`;
-  const blob = new Blob([moduleSource], { type: 'text/javascript' });
-  const url = URL.createObjectURL(blob);
+  const response = (await browserApi.runtime.sendMessage({
+    type: RuntimeMessageType.TempScriptModuleCreate,
+    payload: { scriptId, source },
+  })) as RuntimeResponse<TempScriptModuleCreateResult>;
+
+  if (!response?.ok || !response.payload?.url) {
+    throw new Error(response?.error ?? 'Unable to prepare script module.');
+  }
+
+  const url = response.payload.url;
 
   try {
     const mod = await import(/* @vite-ignore */ url);
@@ -45,11 +56,60 @@ const loadModuleRunner = async (source: string): Promise<(context: unknown) => u
     }
     return mod.default as (context: unknown) => unknown;
   } finally {
-    URL.revokeObjectURL(url);
+    try {
+      await browserApi.runtime.sendMessage({
+        type: RuntimeMessageType.TempScriptModuleRelease,
+        payload: { scriptId },
+      });
+    } catch (releaseError) {
+      log.debug('Module release message failed.', {
+        scriptId,
+        error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+      });
+    }
   }
 };
 
-const executeJs = async (selector: string, jsCode: string | undefined): Promise<CleanupHandler | undefined> => {
+const loadModuleRunner = async (
+  scriptId: string,
+  source: string,
+  moduleUrl?: string,
+): Promise<(context: unknown) => unknown> => {
+  const moduleSource = `export default async (context) => {\n${source}\n};`;
+
+  if (moduleUrl) {
+    try {
+      const mod = await import(/* @vite-ignore */ moduleUrl);
+      if (typeof mod?.default !== 'function') {
+        throw new Error('Generated script did not export a runnable function.');
+      }
+      return mod.default as (context: unknown) => unknown;
+    } catch (error) {
+      log.warn('Module import via provided URL failed, falling back.', {
+        scriptId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  if (typeof browserApi?.runtime?.sendMessage === 'function') {
+    return fetchRemoteModule(scriptId, moduleSource);
+  }
+
+  log.debug('Extension messaging unavailable, using inline evaluation fallback.', {
+    scriptId,
+  });
+
+  const legacyRunner = new Function('context', `'use strict';\n${source}`);
+  return async (context: unknown) => legacyRunner(context);
+};
+
+const executeJs = async (
+  scriptId: string,
+  selector: string,
+  jsCode: string | undefined,
+  moduleUrl?: string,
+): Promise<CleanupHandler | undefined> => {
   if (!jsCode?.trim()) {
     return undefined;
   }
@@ -72,7 +132,7 @@ const executeJs = async (selector: string, jsCode: string | undefined): Promise<
   } as const;
 
   try {
-    const runner = await loadModuleRunner(jsCode);
+    const runner = await loadModuleRunner(scriptId, jsCode, moduleUrl);
     const result = await runner(context);
     if (typeof result === 'function') {
       cleanup = result as CleanupHandler;
@@ -88,7 +148,10 @@ const executeJs = async (selector: string, jsCode: string | undefined): Promise<
   return cleanup;
 };
 
-export const applyPreviewScript = async (script: TemporaryScript) => {
+export const applyPreviewScript = async (
+  script: TemporaryScript,
+  options?: { moduleUrl?: string },
+) => {
   const existing = previews.get(script.id);
   if (existing) {
     void Promise.resolve(existing.cleanup?.()).catch((error) => {
@@ -103,7 +166,7 @@ export const applyPreviewScript = async (script: TemporaryScript) => {
 
   try {
     const styleEl = attachStyle(script.id, script.script.cssCode);
-    const cleanup = await executeJs(script.selector, script.script.jsCode);
+    const cleanup = await executeJs(script.id, script.selector, script.script.jsCode, options?.moduleUrl);
 
     previews.set(script.id, {
       id: script.id,
