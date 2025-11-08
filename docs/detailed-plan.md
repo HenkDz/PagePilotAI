@@ -28,7 +28,7 @@ Status: [x] Complete – baseline utilities, IndexedDB bootstrap, and tooling in
 
 ## Phase 1 – Selector Capture & Sandbox Injection (2-3 sprints)
 
-Status: [~] In progress – selector heuristics, messaging, and preview sandbox covered by tests.
+Status: [x] Complete – selector heuristics, messaging, preview sandbox, and storage fallbacks validated by tests.
 
 **Summary:** Ship the non-AI editing loop: capture DOM targets, inject temporary scripts, and persist session state via IndexedDB.
 
@@ -45,16 +45,19 @@ Status: [~] In progress – selector heuristics, messaging, and preview sandbox 
   - Users can capture an element, inject custom JS via popup, view immediate changes, and remove the script within the session.
   - IndexedDB operations verified in Chromium-based browsers; fallback path tested for environments lacking IndexedDB.
 
+  Retrospective: Vitest suites now cover selector heuristics, preview sandbox lifecycle, messaging helpers, and IndexedDB → `browser.storage.local` fallback behaviour, giving confidence in the manual editing loop ahead of AI integration.
+
 ---
 
 ## Phase 2 – AI-Assisted Editing Loop (3-4 sprints)
 
-Status: [ ] Not started.
+Status: [~] In progress – AI model client integrated with background queue, popup chat workspace, and validation guardrails in place.
 
 **Summary:** Layer in AI chat flow that generates sandboxed scripts using configurable OpenAI-compatible endpoints while reusing Phase 1 plumbing.
 
 - **Goals**
-  - Develop AI client (`src/ai/modelClient.ts`) supporting custom base URL + API key, request retries, and streaming responses when available.
+  - Develop AI client (`src/ai/modelClient.ts`) supporting custom base URL + API key, request retries, and streaming responses when available. *(client, timeout + abort handling shipped; streaming TBD)*
+  - Extend Vitest coverage for AI model client (done) and add integration tests once wired into messaging pipeline.
   - Author prompt templates that include selector context, surrounding DOM, prior attempts, and enforce vanilla JS + MutationObserver usage.
   - Upgrade popup UI into chat workspace with transcripts, context pills, regenerate/accept controls, and settings modal for AI credentials.
   - Validate generated payloads (JSON with `js_code`, `css_code`, `url_match_pattern`) before injection; surface error states clearly.
@@ -63,6 +66,10 @@ Status: [ ] Not started.
   - Secure credential storage leveraging IndexedDB (or encrypted `browser.storage.local`) and runtime configuration guards.
   - Background job manager that queues AI calls, supports cancellation, and throttles requests to respect provider limits.
   - Updated PagePilot wrapper integrating safety checks, sandbox injection, and status callbacks to popup.
+- **Progress to date**
+  - Background worker now orchestrates AI calls via `JobManager`, applies prompt builder/validator, and logs basic telemetry on each generation.
+  - Popup chat experience streams conversation history, exposes preview/regenerate controls, and feeds accepted scripts into the manual preview flow.
+  - Added `src/ai/promptBuilder.ts`, `jobManager.ts`, `scriptValidator.ts` plus targeted Vitest suites to protect prompt formatting, queue semantics, and payload validation.
 - **Exit Criteria**
   - End-to-end flow: user selects DOM target → requests AI script → preview auto-injects → user iterates or approves → optional save to temporary registry.
   - Automated tests cover prompt formatting, response parsing, injection validation, and credential handling.

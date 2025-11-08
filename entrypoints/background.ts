@@ -1,16 +1,26 @@
 import browser from 'webextension-polyfill';
 
 import { logger } from '../src/core/logger';
+import { createModelClient, ModelClientError } from '../src/ai/modelClient';
+import { buildGenerationParams } from '../src/ai/promptBuilder';
+import { JobManager } from '../src/ai/jobManager';
+import { validateGeneratedScript } from '../src/ai/scriptValidator';
 import { listTemporaryScripts, removeTemporaryScript, saveTemporaryScript } from '../src/storage/tempScriptStore';
+import { loadAiProviderConfig } from '../src/storage/settingsStore';
 import { runtimeEnv } from '../src/shared/env';
 import { RuntimeMessageType } from '../src/shared/messages';
 import type {
   CapturedSelectorState,
   RuntimeMessage,
   RuntimeResponse,
+  AiChatMessage,
+  AiGenerationTelemetry,
   TemporaryScript,
 } from '../src/shared/types';
 import type {
+  AiCancelRequestPayload,
+  AiGenerateRequestPayload,
+  AiGenerateResponsePayload,
   SelectorCaptureCommand,
   SelectorGetActivePayload,
   SelectorPreviewState,
@@ -24,6 +34,25 @@ const log = logger.child('background');
 
 const capturedSelectors = new Map<number, CapturedSelectorState>();
 const capturingTabs = new Set<number>();
+const aiJobManager = new JobManager<{ response: AiGenerateResponsePayload; telemetry: AiGenerationTelemetry }>();
+
+const createRequestId = () =>
+  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+const buildAssistantMessage = (overrides: Partial<AiChatMessage>): AiChatMessage => ({
+  id: createRequestId(),
+  role: 'assistant',
+  content: overrides.content ?? '',
+  createdAt: Date.now(),
+  script: overrides.script,
+  usage: overrides.usage,
+  rawText: overrides.rawText,
+  finishReason: overrides.finishReason,
+  error: overrides.error,
+  warnings: overrides.warnings,
+});
 
 const resolveTabId = (payloadTabId: number | undefined, senderTabId: number | undefined) => {
   if (typeof payloadTabId === 'number') {
@@ -310,6 +339,231 @@ const handleTempScriptRemove = async (
   } satisfies RuntimeResponse<unknown>;
 };
 
+const handleAiGenerate = async (
+  payload: AiGenerateRequestPayload,
+  senderTabId: number | undefined,
+): Promise<RuntimeResponse<AiGenerateResponsePayload>> => {
+  const tabId = resolveTabId(payload.tabId, senderTabId);
+  const requestId = createRequestId();
+  const selectorState = capturedSelectors.get(tabId);
+
+  if (!selectorState) {
+    const message = buildAssistantMessage({
+      content: 'Capture an element to provide context before requesting AI assistance.',
+      error: 'No selector captured.',
+    });
+    return {
+      ok: false,
+      error: 'No selector captured.',
+      payload: { requestId, message },
+    } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+  }
+
+  let aiConfig;
+  try {
+    aiConfig = await loadAiProviderConfig();
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    log.error('Failed to load AI provider configuration.', {
+      tabId,
+      error: reason,
+    });
+    const message = buildAssistantMessage({
+      content: 'Unable to read AI provider configuration. Try re-saving settings.',
+      error: reason,
+    });
+    return {
+      ok: false,
+      error: 'Unable to load AI provider configuration.',
+      payload: { requestId, message },
+    } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+  }
+
+  if (!aiConfig.baseUrl?.trim()) {
+    const message = buildAssistantMessage({
+      content: 'Configure the AI provider base URL and API key in settings to use PagePilot AI.',
+      error: 'AI provider not configured.',
+    });
+    return {
+      ok: false,
+      error: 'AI provider not configured.',
+      payload: { requestId, message },
+    } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+  }
+
+  const jobKey = `tab-${tabId}`;
+
+  const jobResult = await aiJobManager.run(jobKey, async (signal) => {
+    const startedAt = Date.now();
+    const client = createModelClient({
+      baseUrl: aiConfig.baseUrl,
+      apiKey: aiConfig.apiKey,
+      model: aiConfig.model,
+      timeoutMs: 30000,
+    });
+
+    const generationParams = buildGenerationParams({
+      userPrompt: payload.prompt,
+      selector: selectorState.descriptor,
+      page: selectorState.context,
+      conversation: payload.conversation,
+    });
+
+    try {
+      const generation = await client.generateScript({
+        ...generationParams,
+        abortSignal: signal,
+      });
+
+      const validation = validateGeneratedScript(generation.script);
+      const message = buildAssistantMessage({
+        content: generation.rawText,
+        script: validation.script ?? generation.script,
+        usage: generation.usage,
+        rawText: generation.rawText,
+        finishReason: generation.finishReason,
+        warnings: validation.warnings,
+      });
+
+      const telemetry: AiGenerationTelemetry = {
+        latencyMs: Date.now() - startedAt,
+        usage: generation.usage,
+        status: validation.ok ? 'success' : 'error',
+        error: validation.ok ? undefined : validation.errors.join(' '),
+      };
+
+      if (!validation.ok) {
+        message.error = validation.errors.join(' ');
+        throw Object.assign(new Error(message.error), {
+          response: { requestId, message },
+          telemetry,
+        });
+      }
+
+      return {
+        response: { requestId, message },
+        telemetry,
+      };
+    } catch (error) {
+      if (signal.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      const reason = error instanceof Error ? error.message : 'AI generation failed.';
+      const message = buildAssistantMessage({
+        content: reason,
+        error: reason,
+      });
+
+      if (error instanceof ModelClientError && error.details) {
+        try {
+          message.rawText = JSON.stringify(error.details);
+        } catch {
+          message.rawText = String(error.details);
+        }
+      }
+
+      const telemetry: AiGenerationTelemetry = {
+        latencyMs: Date.now() - startedAt,
+        status: 'error',
+        error: reason,
+      };
+
+      throw Object.assign(error instanceof Error ? error : new Error(reason), {
+        response: { requestId, message },
+        telemetry,
+      });
+    }
+  });
+
+  if (jobResult.status === 'success') {
+    if (!jobResult.value) {
+      const fallback = buildAssistantMessage({
+        content: 'AI generation completed without a response payload.',
+        error: 'Missing AI response.',
+      });
+      return {
+        ok: false,
+        error: 'AI generation produced no response.',
+        payload: { requestId, message: fallback },
+      } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+    }
+
+    const { response, telemetry } = jobResult.value;
+    log.info('AI generation completed.', {
+      tabId,
+      requestId: response.requestId,
+      latencyMs: telemetry.latencyMs,
+      usage: telemetry.usage,
+    });
+    return {
+      ok: true,
+      payload: response,
+    } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+  }
+
+  if (jobResult.status === 'cancelled') {
+    const message = buildAssistantMessage({
+      content: 'Request cancelled.',
+      error: 'Request cancelled.',
+    });
+    log.debug('AI generation cancelled.', {
+      tabId,
+      requestId,
+    });
+    return {
+      ok: false,
+      error: 'Request cancelled.',
+      payload: { requestId, message },
+    } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+  }
+
+  const error = jobResult.error as (Error & {
+    response?: AiGenerateResponsePayload;
+    telemetry?: AiGenerationTelemetry;
+  });
+
+  const response = error.response ?? {
+    requestId,
+    message: buildAssistantMessage({
+      content: error.message ?? 'AI generation failed.',
+      error: error.message ?? 'AI generation failed.',
+    }),
+  };
+
+  const telemetry = error.telemetry ?? {
+    latencyMs: 0,
+    status: 'error',
+    error: error.message ?? 'AI generation failed.',
+  } satisfies AiGenerationTelemetry;
+
+  log.warn('AI generation failed.', {
+    tabId,
+    requestId: response.requestId,
+    error: error.message ?? 'Unknown error',
+    telemetry,
+  });
+
+  return {
+    ok: false,
+    error: error.message ?? 'AI generation failed.',
+    payload: response,
+  } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+};
+
+const handleAiCancel = (
+  payload: AiCancelRequestPayload,
+  senderTabId: number | undefined,
+): RuntimeResponse<{ cancelled: boolean }> => {
+  const tabId = resolveTabId(payload.tabId, senderTabId);
+  const jobKey = `tab-${tabId}`;
+  aiJobManager.cancel(jobKey);
+  return {
+    ok: true,
+    payload: { cancelled: true },
+  } satisfies RuntimeResponse<{ cancelled: boolean }>;
+};
+
 const handlePing = (payload: unknown) => {
   log.debug('Received ping.', { payload });
   return {
@@ -339,6 +593,10 @@ const handleRuntimeMessage = (
       return handleTempScriptList(message.payload as TempScriptListPayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptRemove:
       return handleTempScriptRemove(message.payload as TempScriptRemovalPayload, sender.tab?.id);
+    case RuntimeMessageType.AiGenerate:
+      return handleAiGenerate(message.payload as AiGenerateRequestPayload, sender.tab?.id);
+    case RuntimeMessageType.AiCancel:
+      return Promise.resolve(handleAiCancel(message.payload as AiCancelRequestPayload, sender.tab?.id));
     default:
       return undefined;
   }
@@ -351,8 +609,9 @@ export default defineBackground(() => {
     version: runtimeEnv.version,
   });
 
-  browser.runtime.onMessage.addListener((message, sender) => {
-    const result = handleRuntimeMessage(message, sender);
+  browser.runtime.onMessage.addListener((message: unknown, sender: browser.Runtime.MessageSender) => {
+    const runtimeMessage = message as RuntimeMessage<RuntimeMessageType, unknown>;
+    const result = handleRuntimeMessage(runtimeMessage, sender);
     if (result) {
       return result;
     }

@@ -128,4 +128,60 @@ describe('modelClient', () => {
       status: 429,
     });
   });
+
+  it('propagates abort signals passed through generateScript params', async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+
+      return new Promise<Response>((resolve, reject) => {
+        const handleAbort = () => {
+          init?.signal?.removeEventListener('abort', handleAbort);
+          reject(new DOMException('Aborted', 'AbortError'));
+        };
+
+        init?.signal?.addEventListener('abort', handleAbort);
+
+        setTimeout(() => {
+          init?.signal?.removeEventListener('abort', handleAbort);
+          resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': 'application/json' }),
+            text: async () => JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: '{"jsCode":"console.log(1);"}',
+                  },
+                },
+              ],
+            }),
+          } as unknown as Response);
+        }, 5);
+      });
+    });
+
+    const client = createModelClient(config, {
+      ...deps,
+      AbortController,
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const externalController = new AbortController();
+    const promise = client.generateScript({
+      ...buildParams(),
+      abortSignal: externalController.signal,
+    });
+
+    externalController.abort();
+
+    await expect(promise).rejects.toMatchObject({
+      name: 'ModelClientError',
+      message: 'Model request timed out.',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

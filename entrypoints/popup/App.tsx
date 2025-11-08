@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import browser from 'webextension-polyfill';
 
 import './App.css';
@@ -8,10 +8,13 @@ import { RuntimeMessageType } from '../../src/shared/messages';
 import type {
   AiProviderConfig,
   CapturedSelectorState,
+  GeneratedScriptPayload,
   RuntimeMessage,
+  RuntimeResponse,
   TemporaryScript,
 } from '../../src/shared/types';
-import type { SelectorPreviewState } from '../../src/shared/messages';
+import type { SelectorPreviewState, AiGenerateResponsePayload } from '../../src/shared/messages';
+import type { AiChatMessage } from '../../src/shared/types';
 
 const createEmptyConfig = (): AiProviderConfig => ({
   baseUrl: defaultAiProviderConfig.baseUrl,
@@ -20,6 +23,9 @@ const createEmptyConfig = (): AiProviderConfig => ({
 });
 
 type ViewMode = 'home' | 'settings';
+
+const createLocalMessageId = () =>
+  `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 
 const CaptureIcon = () => (
   <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
@@ -104,6 +110,17 @@ const App = () => {
   const [configStatusTone, setConfigStatusTone] = useState<'muted' | 'success' | 'error'>('muted');
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [isApplyingPreview, setIsApplyingPreview] = useState(false);
+  const [aiConversation, setAiConversation] = useState<AiChatMessage[]>([]);
+  const [aiInput, setAiInput] = useState('');
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [isGeneratingScript, setIsGeneratingScript] = useState(false);
+  const aiFeedRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (aiFeedRef.current) {
+      aiFeedRef.current.scrollTop = aiFeedRef.current.scrollHeight;
+    }
+  }, [aiConversation]);
 
   useEffect(() => {
     const resolveActiveTab = async () => {
@@ -153,12 +170,13 @@ const App = () => {
   }, [activeTabId]);
 
   useEffect(() => {
-    const handleRuntimeMessage = (message: RuntimeMessage<RuntimeMessageType, unknown>) => {
-      if (message.type !== RuntimeMessageType.SelectorPreviewUpdated) {
+    const handleRuntimeMessage = (message: unknown) => {
+      const runtimeMessage = message as RuntimeMessage<RuntimeMessageType, unknown>;
+      if (runtimeMessage.type !== RuntimeMessageType.SelectorPreviewUpdated) {
         return;
       }
 
-      const payload = message.payload as SelectorPreviewState;
+      const payload = runtimeMessage.payload as SelectorPreviewState;
       if (activeTabId === null || payload.tabId !== activeTabId) {
         return;
       }
@@ -259,6 +277,73 @@ const App = () => {
 
   const hasAiProvider = Boolean(aiConfig.apiKey && aiConfig.apiKey.trim());
 
+  const applyScriptPreview = useCallback(
+    async (script: GeneratedScriptPayload, note?: string) => {
+      if (activeTabId === null) {
+        setPreviewError('Open a tab to apply preview.');
+        return;
+      }
+      if (!selectorState) {
+        setPreviewError('Capture a target element first.');
+        return;
+      }
+      if (!script.jsCode?.trim() && !script.cssCode?.trim()) {
+        setPreviewError('Generated script is empty.');
+        return;
+      }
+
+      setPreviewError(null);
+      setPreviewInfo(null);
+      setIsApplyingPreview(true);
+
+      if (activePreviewId) {
+        try {
+          await browser.runtime.sendMessage({
+            type: RuntimeMessageType.TempScriptRemove,
+            payload: { tabId: activeTabId, scriptId: activePreviewId },
+          });
+        } catch (error) {
+          console.warn('Failed to clear previous preview before applying AI script.', error);
+        } finally {
+          setActivePreviewId(null);
+        }
+      }
+
+      try {
+        const response = (await browser.runtime.sendMessage({
+          type: RuntimeMessageType.TempScriptCreate,
+          payload: {
+            tabId: activeTabId,
+            selector: selectorState.descriptor.selector,
+            jsCode: script.jsCode,
+            cssCode: script.cssCode,
+            notes: note,
+          },
+        })) as { ok: boolean; payload?: TemporaryScript; error?: string };
+
+        if (!response?.ok || !response.payload) {
+          setPreviewError(response?.error ?? 'Preview failed to apply.');
+          return;
+        }
+
+        setActivePreviewId(response.payload.id);
+        setPreviewInfo('Preview applied.');
+        setSelectedScriptId(response.payload.id);
+        setJsCode(script.jsCode ?? '');
+        setCssCode(script.cssCode ?? '');
+        if (typeof note === 'string') {
+          setNotes(note);
+        }
+        await refreshActiveScripts();
+      } catch (error) {
+        setPreviewError(error instanceof Error ? error.message : 'Preview failed to apply.');
+      } finally {
+        setIsApplyingPreview(false);
+      }
+    },
+    [activePreviewId, activeTabId, refreshActiveScripts, selectorState],
+  );
+
   const handleSelectScript = (script: TemporaryScript) => {
     setSelectedScriptId(script.id);
     setJsCode(script.script.jsCode ?? '');
@@ -335,10 +420,6 @@ const App = () => {
   };
 
   const handleApplyPreview = async () => {
-    if (activeTabId === null) {
-      setPreviewError('Open a tab to apply preview.');
-      return;
-    }
     if (!hasCaptured) {
       setPreviewError('Capture a target element first.');
       return;
@@ -348,49 +429,13 @@ const App = () => {
       return;
     }
 
-    setPreviewError(null);
-    setPreviewInfo(null);
-    setIsApplyingPreview(true);
-
-    if (activePreviewId) {
-      try {
-        await browser.runtime.sendMessage({
-          type: RuntimeMessageType.TempScriptRemove,
-          payload: { tabId: activeTabId, scriptId: activePreviewId },
-        });
-      } catch (error) {
-        console.warn('Failed to clear previous preview before applying a new one.', error);
-      } finally {
-        setActivePreviewId(null);
-      }
-    }
-
-    try {
-      const response = (await browser.runtime.sendMessage({
-        type: RuntimeMessageType.TempScriptCreate,
-        payload: {
-          tabId: activeTabId,
-          selector: selectorState.descriptor.selector,
-          jsCode,
-          cssCode: cssCode.trim() ? cssCode : undefined,
-          notes: notes.trim() || undefined,
-        },
-      })) as { ok: boolean; payload?: TemporaryScript; error?: string };
-
-      if (!response?.ok || !response.payload) {
-        setPreviewError(response?.error ?? 'Preview failed to apply.');
-        return;
-      }
-
-      setActivePreviewId(response.payload.id);
-      setPreviewInfo('Preview applied.');
-      setSelectedScriptId(response.payload.id);
-      await refreshActiveScripts();
-    } catch (error) {
-      setPreviewError(error instanceof Error ? error.message : 'Preview failed to apply.');
-    } finally {
-      setIsApplyingPreview(false);
-    }
+    await applyScriptPreview(
+      {
+        jsCode,
+        cssCode: cssCode.trim() ? cssCode : undefined,
+      },
+      notes.trim() ? notes : undefined,
+    );
   };
 
   const handleRemoveScript = async (scriptId: string) => {
@@ -467,6 +512,137 @@ const App = () => {
     setConfigStatus('Settings reset to defaults.');
     setConfigStatusTone('muted');
   };
+
+  const handlePreviewAiScript = useCallback(
+    async (message: AiChatMessage) => {
+      if (!message.script) {
+        setAiError('AI response did not include a script to preview.');
+        return;
+      }
+
+      const text = message.content?.trim() ?? 'AI generated script';
+      const noteSnippet = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+      await applyScriptPreview(message.script, `AI: ${noteSnippet}`);
+    },
+    [applyScriptPreview],
+  );
+
+  const submitPrompt = useCallback(
+    async (promptText: string, history: AiChatMessage[]) => {
+      const trimmed = promptText.trim();
+      if (!trimmed) {
+        return;
+      }
+
+      if (activeTabId === null) {
+        setAiError('Open a tab before using AI assist.');
+        return;
+      }
+
+      if (!hasAiProvider) {
+        setAiError('Connect an AI provider in settings first.');
+        return;
+      }
+
+      if (!hasCaptured) {
+        setAiError('Capture an element before asking the AI.');
+        return;
+      }
+
+      const userMessage: AiChatMessage = {
+        id: createLocalMessageId(),
+        role: 'user',
+        content: trimmed,
+        createdAt: Date.now(),
+      };
+
+      setAiConversation((prev) => [...prev, userMessage]);
+      setAiError(null);
+      setIsGeneratingScript(true);
+
+      try {
+        const response = (await browser.runtime.sendMessage({
+          type: RuntimeMessageType.AiGenerate,
+          payload: {
+            tabId: activeTabId,
+            prompt: trimmed,
+            conversation: history,
+          },
+        })) as RuntimeResponse<AiGenerateResponsePayload>;
+
+        if (response.payload?.message) {
+          setAiConversation((prev) => [...prev, response.payload!.message]);
+        }
+
+        if (!response.ok) {
+          const reason = response.error ?? 'AI request failed.';
+          setAiError(reason);
+          if (!response.payload?.message) {
+            const assistantMessage: AiChatMessage = {
+              id: createLocalMessageId(),
+              role: 'assistant',
+              content: reason,
+              error: reason,
+              createdAt: Date.now(),
+            };
+            setAiConversation((prev) => [...prev, assistantMessage]);
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'AI request failed.';
+        setAiError(reason);
+        const assistantMessage: AiChatMessage = {
+          id: createLocalMessageId(),
+          role: 'assistant',
+          content: reason,
+          error: reason,
+          createdAt: Date.now(),
+        };
+        setAiConversation((prev) => [...prev, assistantMessage]);
+      } finally {
+        setIsGeneratingScript(false);
+      }
+    },
+    [activeTabId, hasAiProvider, hasCaptured],
+  );
+
+  const handleAiSubmit = useCallback(
+    async (event?: FormEvent<HTMLFormElement>) => {
+      event?.preventDefault();
+      const trimmed = aiInput.trim();
+      if (!trimmed) {
+        return;
+      }
+
+      setAiInput('');
+      const history = aiConversation.slice();
+      await submitPrompt(trimmed, history);
+    },
+    [aiConversation, aiInput, submitPrompt],
+  );
+
+  const handleAiCancel = useCallback(async () => {
+    if (!isGeneratingScript || activeTabId === null) {
+      return;
+    }
+
+    try {
+      await browser.runtime.sendMessage({
+        type: RuntimeMessageType.AiCancel,
+        payload: { tabId: activeTabId },
+      });
+    } catch (error) {
+      console.warn('Failed to cancel AI request.', error);
+    }
+  }, [activeTabId, isGeneratingScript]);
+
+  const handleAiRegenerate = useCallback(
+    async (promptText: string) => {
+      const history = aiConversation.slice();
+      await submitPrompt(promptText, history);
+    },
+    [aiConversation, submitPrompt],
+  );
 
   return (
     <main className={`app ${view === 'settings' ? 'app-settings' : 'app-home'}`}>
@@ -709,21 +885,123 @@ const App = () => {
             </div>
           </section>
 
-          <section className="card ai-card">
+          <section className="card ai-chat-card">
             <div className="section-header">
-              <h2>AI assist</h2>
+              <h2>AI workspace</h2>
               <span className={`status-pill ${hasAiProvider ? 'status-pill-ready' : 'status-pill-idle'}`}>
                 {hasAiProvider ? 'Ready' : 'Not configured'}
               </span>
             </div>
             <p className="section-subtitle">
-              Generate scripts with GPT once your provider is connected.
+              Chat with PagePilot to generate scripts from your current selection.
             </p>
-            <div className="actions">
-              <button className="button primary" onClick={() => setView('settings')}>
-                {hasAiProvider ? 'Open AI settings' : 'Connect provider'}
-              </button>
+            <div className="ai-chat-feed" ref={aiFeedRef}>
+              {aiConversation.length === 0 ? (
+                <p className="empty-state">Ask PagePilot how you would like the selected element to behave.</p>
+              ) : (
+                aiConversation.map((message, index) => {
+                  const isUser = message.role === 'user';
+                  const cssSnippet = message.script?.cssCode?.trim();
+
+                  let previousUserPrompt: string | undefined;
+                  if (!isUser) {
+                    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+                      const candidate = aiConversation[cursor];
+                      if (candidate.role === 'user') {
+                        previousUserPrompt = candidate.content;
+                        break;
+                      }
+                    }
+                  }
+
+                  return (
+                    <div
+                      key={message.id}
+                      className={`ai-chat-bubble ${isUser ? 'ai-chat-bubble-user' : 'ai-chat-bubble-assistant'}`}
+                    >
+                      <div className="ai-chat-meta">
+                        <span>{isUser ? 'You' : 'PagePilot'}</span>
+                        <span>{formatRelativeTime(message.createdAt)}</span>
+                      </div>
+                      <div className="ai-chat-content">
+                        {message.content && (
+                          <pre className="ai-chat-text">{message.content}</pre>
+                        )}
+                        {message.script && (
+                          <div className="ai-script-block">
+                            <div className="ai-script-header">
+                              <span>Script proposal</span>
+                              {message.usage?.totalTokens && (
+                                <span className="ai-usage-pill">
+                                  {`${message.usage.totalTokens} tokens`}
+                                </span>
+                              )}
+                            </div>
+                            <pre className="ai-script-code">{message.script.jsCode}</pre>
+                            {cssSnippet && (
+                              <details className="ai-css-details">
+                                <summary>CSS rules</summary>
+                                <pre>{cssSnippet}</pre>
+                              </details>
+                            )}
+                            <div className="ai-script-actions">
+                              <button
+                                className="chip-button"
+                                type="button"
+                                onClick={() => handlePreviewAiScript(message)}
+                                disabled={isApplyingPreview || Boolean(message.error)}
+                              >
+                                Preview script
+                              </button>
+                              {previousUserPrompt && (
+                                <button
+                                  className="chip-button ghost"
+                                  type="button"
+                                  onClick={() => handleAiRegenerate(previousUserPrompt)}
+                                  disabled={isGeneratingScript}
+                                >
+                                  Regenerate
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                        {message.warnings?.map((warning) => (
+                          <p key={warning} className="message muted">
+                            {warning}
+                          </p>
+                        ))}
+                        {message.error && (
+                          <p className="message error">{message.error}</p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
             </div>
+            {aiError && <p className="message error">{aiError}</p>}
+            <form className="ai-chat-form" onSubmit={handleAiSubmit}>
+              <textarea
+                className="ai-chat-input"
+                value={aiInput}
+                onChange={(event) => setAiInput(event.target.value)}
+                placeholder={hasAiProvider ? 'Describe the change you want to see.' : 'Connect a provider in settings first.'}
+                disabled={!hasAiProvider}
+                spellCheck={false}
+              />
+              <div className="ai-chat-buttons">
+                <button className="button primary" type="submit" disabled={isGeneratingScript || !hasAiProvider}>
+                  {isGeneratingScript ? 'Generating…' : 'Ask PagePilot'}
+                </button>
+                <button className="button ghost" type="button" onClick={handleAiCancel} disabled={!isGeneratingScript}>
+                  Cancel
+                </button>
+                <button className="chip-button ghost" type="button" onClick={() => setView('settings')}>
+                  Settings
+                </button>
+              </div>
+            </form>
           </section>
         </>
       )}

@@ -12,7 +12,15 @@ export enum RuntimeMessageType {
   TempScriptList = 'temp-script/list',
   TempScriptRemove = 'temp-script/remove',
   TempScriptRevoke = 'temp-script/revoke',
+  AiGenerate = 'ai/generate',
+  AiCancel = 'ai/cancel',
 }
+import type {
+  AiChatMessage,
+  PageContextSnapshot,
+  SelectorDescriptor,
+  TemporaryScript,
+} from './types';
 
 export interface PingMessage {
   timestamp: number;
@@ -66,6 +74,22 @@ export interface TempScriptRevokePayload {
   scriptId: string;
 }
 
+export interface AiGenerateRequestPayload {
+  tabId: number;
+  prompt: string;
+  conversation?: AiChatMessage[];
+}
+
+export interface AiGenerateResponsePayload {
+  requestId: string;
+  message: AiChatMessage;
+}
+
+export interface AiCancelRequestPayload {
+  tabId: number;
+  requestId?: string;
+}
+
 export type RuntimePayloads = {
   [RuntimeMessageType.Ping]: PingMessage;
   [RuntimeMessageType.SelectorCaptureStart]: SelectorCaptureCommand;
@@ -78,4 +102,6 @@ export type RuntimePayloads = {
   [RuntimeMessageType.TempScriptList]: TempScriptListPayload;
   [RuntimeMessageType.TempScriptRemove]: TempScriptRemovalPayload;
   [RuntimeMessageType.TempScriptRevoke]: TempScriptRevokePayload;
+  [RuntimeMessageType.AiGenerate]: AiGenerateRequestPayload;
+  [RuntimeMessageType.AiCancel]: AiCancelRequestPayload;
 };

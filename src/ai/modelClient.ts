@@ -1,5 +1,10 @@
 import { defaultAiProviderConfig } from '../shared/env';
-import type { GeneratedScriptPayload, PageContextSnapshot, SelectorDescriptor } from '../shared/types';
+import type {
+  GeneratedScriptPayload,
+  ModelUsageStats,
+  PageContextSnapshot,
+  SelectorDescriptor,
+} from '../shared/types';
 
 export class ModelClientError extends Error {
   readonly status?: number;
@@ -34,12 +39,7 @@ export interface GenerateScriptParams {
   maxOutputTokens?: number;
   systemPrompt?: string;
   responseFormat?: 'json' | 'text';
-}
-
-export interface ModelUsageStats {
-  promptTokens?: number;
-  completionTokens?: number;
-  totalTokens?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface GenerateScriptResult {
@@ -186,6 +186,15 @@ export const createModelClient = (
 
   const generateScript = async (params: GenerateScriptParams): Promise<GenerateScriptResult> => {
     const controller = new deps.AbortController();
+    const handleAbortProxy = () => controller.abort();
+
+    if (params.abortSignal) {
+      if (params.abortSignal.aborted) {
+        controller.abort();
+      } else {
+        params.abortSignal.addEventListener('abort', handleAbortProxy, { once: true });
+      }
+    }
     const abortTimer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
 
     try {
@@ -258,6 +267,9 @@ export const createModelClient = (
     } finally {
       if (abortTimer) {
         clearTimeout(abortTimer);
+      }
+      if (params.abortSignal) {
+        params.abortSignal.removeEventListener('abort', handleAbortProxy);
       }
     }
   };

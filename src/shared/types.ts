@@ -17,6 +17,12 @@ export interface GeneratedScriptPayload {
   urlMatchPattern?: string;
 }
 
+export interface ModelUsageStats {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
 export interface TemporaryScript {
   id: string;
   createdAt: number;
@@ -50,6 +56,28 @@ export interface AiProviderConfig {
   baseUrl: string;
   apiKey: string | null;
   model: string;
+}
+
+export type AiChatRole = 'user' | 'assistant' | 'system';
+
+export interface AiChatMessage {
+  id: string;
+  role: AiChatRole;
+  content: string;
+  createdAt: number;
+  script?: GeneratedScriptPayload;
+  usage?: ModelUsageStats;
+  rawText?: string;
+  finishReason?: string;
+  error?: string;
+  warnings?: string[];
+}
+
+export interface AiGenerationTelemetry {
+  latencyMs: number;
+  usage?: ModelUsageStats;
+  status: 'success' | 'error' | 'cancelled';
+  error?: string;
 }
 
 export interface CapturedSelectorState {
