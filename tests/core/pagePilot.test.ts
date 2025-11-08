@@ -21,6 +21,7 @@ const buildScript = (overrides: Partial<TemporaryScript> = {}): TemporaryScript 
   id: overrides.id ?? `script-${Math.random().toString(36).slice(2, 10)}`,
   createdAt: overrides.createdAt ?? Date.now(),
   updatedAt: overrides.updatedAt ?? Date.now(),
+  name: overrides.name,
   selector: overrides.selector ?? '#target',
   context: overrides.context ?? {
     url: 'https://example.test',
@@ -31,7 +32,6 @@ const buildScript = (overrides: Partial<TemporaryScript> = {}): TemporaryScript 
     cssCode: undefined,
   },
   status: overrides.status ?? 'pending',
-  notes: overrides.notes,
   errorMessage: overrides.errorMessage,
 });
 
@@ -49,13 +49,13 @@ describe('pagePilot preview lifecycle', () => {
     document.body.innerHTML = '';
   });
 
-  it('attaches css styles and removes them on revoke', () => {
+  it('attaches css styles and removes them on revoke', async () => {
     const script = buildScript({
       id: 'css-only',
       script: { jsCode: '', cssCode: '#target { color: rgb(255, 0, 0); }' },
     });
 
-    applyPreviewScript(script);
+    await applyPreviewScript(script);
 
     const style = document.querySelector<HTMLStyleElement>('style[data-pagepilot-script-id="css-only"]');
     expect(style).not.toBeNull();
@@ -67,7 +67,7 @@ describe('pagePilot preview lifecycle', () => {
     expect(removedStyle).toBeNull();
   });
 
-  it('invokes registered cleanup callbacks when script is revoked', () => {
+  it('invokes registered cleanup callbacks when script is revoked', async () => {
     const target = document.querySelector('#target');
     const script = buildScript({
       id: 'cleanup-test',
@@ -82,7 +82,7 @@ describe('pagePilot preview lifecycle', () => {
       },
     });
 
-    applyPreviewScript(script);
+    await applyPreviewScript(script);
 
     expect(target?.classList.contains('preview-active')).toBe(true);
 
@@ -91,7 +91,7 @@ describe('pagePilot preview lifecycle', () => {
     expect(target?.classList.contains('preview-active')).toBe(false);
   });
 
-  it('cleans up previous preview when re-applying the same script id', () => {
+  it('cleans up previous preview when re-applying the same script id', async () => {
     const target = document.querySelector('#target');
     (window as typeof window & { __cleanupRuns?: number }).__cleanupRuns = 0;
 
@@ -108,8 +108,8 @@ describe('pagePilot preview lifecycle', () => {
       },
     });
 
-    applyPreviewScript(script);
-    applyPreviewScript(script);
+    await applyPreviewScript(script);
+    await applyPreviewScript(script);
 
     const styleElements = document.querySelectorAll('style[data-pagepilot-script-id="reapply"]');
     expect(styleElements).toHaveLength(1);
@@ -117,7 +117,7 @@ describe('pagePilot preview lifecycle', () => {
     expect(target?.getAttribute('data-run')).toBe('2');
   });
 
-  it('removes injected style if javascript execution fails', () => {
+  it('removes injected style if javascript execution fails', async () => {
     const script = buildScript({
       id: 'failure',
       script: {
@@ -126,12 +126,12 @@ describe('pagePilot preview lifecycle', () => {
       },
     });
 
-    expect(() => applyPreviewScript(script)).toThrowError('preview failed');
+    await expect(applyPreviewScript(script)).rejects.toThrowError('preview failed');
     const leftoverStyle = document.querySelector<HTMLStyleElement>('style[data-pagepilot-script-id="failure"]');
     expect(leftoverStyle).toBeNull();
   });
 
-  it('clears all previews and executes cleanup handlers', () => {
+  it('clears all previews and executes cleanup handlers', async () => {
     const target = document.querySelector('#target');
     const other = document.createElement('div');
     other.id = 'secondary';
@@ -163,8 +163,8 @@ describe('pagePilot preview lifecycle', () => {
       },
     });
 
-    applyPreviewScript(first);
-    applyPreviewScript(second);
+    await applyPreviewScript(first);
+    await applyPreviewScript(second);
 
     expect(document.querySelectorAll('style[data-pagepilot-script-id]').length).toBe(2);
 
@@ -175,7 +175,7 @@ describe('pagePilot preview lifecycle', () => {
     expect(document.getElementById('secondary')).toBeNull();
   });
 
-  it('swallows cleanup errors while logging a warning', () => {
+  it('swallows cleanup errors while logging a warning', async () => {
     const script = buildScript({
       id: 'cleanup-error',
       script: {
@@ -188,7 +188,7 @@ describe('pagePilot preview lifecycle', () => {
       },
     });
 
-    applyPreviewScript(script);
+    await applyPreviewScript(script);
 
     expect(() => removePreviewScript(script.id)).not.toThrow();
     expect(loggerMock.warn).toHaveBeenCalledWith('Cleanup for preview script threw an error.', expect.objectContaining({ scriptId: 'cleanup-error' }));

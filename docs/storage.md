@@ -29,12 +29,12 @@ interface TemporaryScript {
   id: string;
   createdAt: number;
   updatedAt: number;
+  name?: string;
   selector: string;
   context: PageContextSnapshot;
   script: GeneratedScriptPayload;
-  status: 'pending' | 'applied' | 'failed';
+  status: 'pending' | 'applied' | 'failed' | 'disabled';
   errorMessage?: string;
-  notes?: string;
 }
 ```
 

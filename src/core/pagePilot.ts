@@ -1,10 +1,12 @@
 import { logger } from './logger';
 import type { TemporaryScript } from '../shared/types';
 
+type CleanupHandler = () => void | Promise<void>;
+
 interface PreviewEntry {
   id: string;
   selector: string;
-  cleanup?: () => void;
+  cleanup?: CleanupHandler;
   styleEl?: HTMLStyleElement;
 }
 
@@ -25,19 +27,41 @@ const attachStyle = (id: string, cssCode: string | undefined): HTMLStyleElement 
   return style;
 };
 
-const executeJs = (selector: string, jsCode: string | undefined): (() => void) | undefined => {
+const loadModuleRunner = async (source: string): Promise<(context: unknown) => unknown> => {
+  if (typeof URL.createObjectURL !== 'function' || typeof Blob === 'undefined') {
+    // Fallback for environments (like unit tests) that do not expose blob URLs.
+    const legacyRunner = new Function('context', `'use strict';\n${source}`);
+    return async (context: unknown) => legacyRunner(context);
+  }
+
+  const moduleSource = `export default async (context) => {\n${source}\n};`;
+  const blob = new Blob([moduleSource], { type: 'text/javascript' });
+  const url = URL.createObjectURL(blob);
+
+  try {
+    const mod = await import(/* @vite-ignore */ url);
+    if (typeof mod?.default !== 'function') {
+      throw new Error('Generated script did not export a runnable function.');
+    }
+    return mod.default as (context: unknown) => unknown;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+};
+
+const executeJs = async (selector: string, jsCode: string | undefined): Promise<CleanupHandler | undefined> => {
   if (!jsCode?.trim()) {
     return undefined;
   }
 
   const elements = Array.from(document.querySelectorAll(selector));
-  let cleanup: (() => void) | undefined;
+  let cleanup: CleanupHandler | undefined;
 
   const context = {
     selector,
     elements,
     firstElement: elements[0] ?? null,
-    registerCleanup: (callback: () => void) => {
+    registerCleanup: (callback: () => void | Promise<void>) => {
       if (typeof callback === 'function') {
         cleanup = callback;
       }
@@ -48,8 +72,11 @@ const executeJs = (selector: string, jsCode: string | undefined): (() => void) |
   } as const;
 
   try {
-    const runner = new Function('context', `'use strict';\n` + jsCode);
-    runner(context);
+    const runner = await loadModuleRunner(jsCode);
+    const result = await runner(context);
+    if (typeof result === 'function') {
+      cleanup = result as CleanupHandler;
+    }
   } catch (error) {
     log.warn('Preview script execution failed.', {
       selector,
@@ -61,17 +88,22 @@ const executeJs = (selector: string, jsCode: string | undefined): (() => void) |
   return cleanup;
 };
 
-export const applyPreviewScript = (script: TemporaryScript) => {
+export const applyPreviewScript = async (script: TemporaryScript) => {
   const existing = previews.get(script.id);
   if (existing) {
-    existing.cleanup?.();
+    void Promise.resolve(existing.cleanup?.()).catch((error) => {
+      log.warn('Cleanup for preview script threw an error.', {
+        scriptId: script.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     existing.styleEl?.remove();
     previews.delete(script.id);
   }
 
   try {
     const styleEl = attachStyle(script.id, script.script.cssCode);
-    const cleanup = executeJs(script.selector, script.script.jsCode);
+    const cleanup = await executeJs(script.selector, script.script.jsCode);
 
     previews.set(script.id, {
       id: script.id,
@@ -93,7 +125,12 @@ export const removePreviewScript = (scriptId: string) => {
   }
 
   try {
-    entry.cleanup?.();
+    void Promise.resolve(entry.cleanup?.()).catch((error) => {
+      log.warn('Cleanup for preview script threw an error.', {
+        scriptId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
   } catch (error) {
     log.warn('Cleanup for preview script threw an error.', {
       scriptId,

@@ -22,7 +22,7 @@ describe('modelClient', () => {
     }));
 
   const config: ModelClientConfig = {
-    baseUrl: 'https://api.example.test',
+    baseUrl: 'https://api.example.test/v1',
     apiKey: 'sk-test',
     model: 'gpt-preview',
     timeoutMs: 5000,
@@ -113,6 +113,29 @@ describe('modelClient', () => {
     expect(result.script).toEqual({ jsCode: 'console.log("raw");' });
     const [, init] = (fetchMock as unknown as Mock).mock.calls[0] as [string, RequestInit];
     expect(init?.headers).not.toHaveProperty('Authorization');
+  });
+
+  it('supports array-based content payloads from OpenRouter style responses', async () => {
+    const fetchMock = createFetchMock(200, {
+      choices: [
+        {
+          message: {
+            content: [
+              {
+                type: 'text',
+                text: '{"jsCode":"console.log(42);"}',
+              },
+            ],
+          },
+          finish_reason: 'stop',
+        },
+      ],
+    });
+
+    const client = createModelClient(config, { ...deps, fetch: fetchMock as unknown as typeof fetch });
+    const result = await client.generateScript(buildParams());
+
+    expect(result.script).toEqual({ jsCode: 'console.log(42);' });
   });
 
   it('throws ModelClientError with API response details on failure', async () => {

@@ -97,7 +97,7 @@ const App = () => {
   const [activePreviewId, setActivePreviewId] = useState<string | null>(null);
   const [jsCode, setJsCode] = useState('');
   const [cssCode, setCssCode] = useState('');
-  const [notes, setNotes] = useState('');
+  const [scriptName, setScriptName] = useState('');
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewInfo, setPreviewInfo] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
@@ -105,16 +105,19 @@ const App = () => {
   const [scriptsError, setScriptsError] = useState<string | null>(null);
   const [isSyncingScripts, setIsSyncingScripts] = useState(false);
   const [selectedScriptId, setSelectedScriptId] = useState<string | null>(null);
+  const [togglingScriptId, setTogglingScriptId] = useState<string | null>(null);
   const [aiConfig, setAiConfig] = useState<AiProviderConfig>(createEmptyConfig);
   const [configStatus, setConfigStatus] = useState<string | null>(null);
   const [configStatusTone, setConfigStatusTone] = useState<'muted' | 'success' | 'error'>('muted');
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [isApplyingPreview, setIsApplyingPreview] = useState(false);
+  const [isManualEditorOpen, setManualEditorOpen] = useState(false);
   const [aiConversation, setAiConversation] = useState<AiChatMessage[]>([]);
   const [aiInput, setAiInput] = useState('');
   const [aiError, setAiError] = useState<string | null>(null);
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
   const aiFeedRef = useRef<HTMLDivElement | null>(null);
+  const lastSelectorIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (aiFeedRef.current) {
@@ -135,6 +138,21 @@ const App = () => {
       console.error('Failed to resolve active tab.', error);
     });
   }, []);
+
+  useEffect(() => {
+    const currentSelectorId = selectorState?.descriptor?.id ?? null;
+
+    if (!currentSelectorId) {
+      lastSelectorIdRef.current = null;
+      return;
+    }
+
+    if (lastSelectorIdRef.current !== currentSelectorId) {
+      lastSelectorIdRef.current = currentSelectorId;
+      setView('home');
+      setManualEditorOpen(true);
+    }
+  }, [selectorState, setManualEditorOpen, setView]);
 
   useEffect(() => {
     loadAiProviderConfig()
@@ -247,6 +265,9 @@ const App = () => {
     const exists = activeScripts.some((script) => script.id === selectedScriptId);
     if (!exists) {
       setSelectedScriptId(null);
+      setJsCode('');
+      setCssCode('');
+      setScriptName('');
     }
   }, [activeScripts, selectedScriptId]);
 
@@ -278,7 +299,7 @@ const App = () => {
   const hasAiProvider = Boolean(aiConfig.apiKey && aiConfig.apiKey.trim());
 
   const applyScriptPreview = useCallback(
-    async (script: GeneratedScriptPayload, note?: string) => {
+    async (script: GeneratedScriptPayload, options?: { name?: string }) => {
       if (activeTabId === null) {
         setPreviewError('Open a tab to apply preview.');
         return;
@@ -317,7 +338,7 @@ const App = () => {
             selector: selectorState.descriptor.selector,
             jsCode: script.jsCode,
             cssCode: script.cssCode,
-            notes: note,
+            name: options?.name,
           },
         })) as { ok: boolean; payload?: TemporaryScript; error?: string };
 
@@ -331,9 +352,7 @@ const App = () => {
         setSelectedScriptId(response.payload.id);
         setJsCode(script.jsCode ?? '');
         setCssCode(script.cssCode ?? '');
-        if (typeof note === 'string') {
-          setNotes(note);
-        }
+        setScriptName(response.payload.name ?? options?.name ?? '');
         await refreshActiveScripts();
       } catch (error) {
         setPreviewError(error instanceof Error ? error.message : 'Preview failed to apply.');
@@ -348,10 +367,11 @@ const App = () => {
     setSelectedScriptId(script.id);
     setJsCode(script.script.jsCode ?? '');
     setCssCode(script.script.cssCode ?? '');
-    setNotes(script.notes ?? '');
+    setScriptName(script.name ?? '');
     setActivePreviewId(script.id);
     setPreviewError(null);
     setPreviewInfo(null);
+    setManualEditorOpen(true);
   };
 
   const handleStartCapture = async () => {
@@ -434,7 +454,7 @@ const App = () => {
         jsCode,
         cssCode: cssCode.trim() ? cssCode : undefined,
       },
-      notes.trim() ? notes : undefined,
+      { name: scriptName.trim() || undefined },
     );
   };
 
@@ -464,6 +484,59 @@ const App = () => {
       });
     }
   };
+
+  const handleToggleScript = useCallback(
+    async (script: TemporaryScript, enabled: boolean) => {
+      if (activeTabId === null) {
+        return;
+      }
+
+      setTogglingScriptId(script.id);
+      setScriptsError(null);
+
+      try {
+        const response = (await browser.runtime.sendMessage({
+          type: RuntimeMessageType.TempScriptToggle,
+          payload: {
+            tabId: activeTabId,
+            scriptId: script.id,
+            enabled,
+          },
+        })) as RuntimeResponse<{ script: TemporaryScript }>;
+
+        if (!response.ok) {
+          setScriptsError(response.error ?? 'Unable to update script.');
+        }
+
+        await refreshActiveScripts();
+
+        const updated = response.payload?.script;
+        if (response.ok && updated) {
+          if (enabled) {
+            setActivePreviewId(updated.id);
+            setPreviewInfo('Script enabled.');
+            setPreviewError(null);
+          } else {
+            setPreviewInfo('Script disabled.');
+            if (activePreviewId === updated.id) {
+              setActivePreviewId(null);
+            }
+          }
+
+          if (selectedScriptId === updated.id) {
+            setJsCode(updated.script.jsCode ?? '');
+            setCssCode(updated.script.cssCode ?? '');
+            setScriptName(updated.name ?? '');
+          }
+        }
+      } catch (error) {
+        setScriptsError(error instanceof Error ? error.message : 'Unable to update script.');
+      } finally {
+        setTogglingScriptId(null);
+      }
+    },
+    [activeTabId, refreshActiveScripts, activePreviewId, selectedScriptId],
+  );
 
   const handleCaptureToggle = () => {
     if (isCapturing) {
@@ -520,9 +593,13 @@ const App = () => {
         return;
       }
 
-      const text = message.content?.trim() ?? 'AI generated script';
-      const noteSnippet = text.length > 80 ? `${text.slice(0, 80)}…` : text;
-      await applyScriptPreview(message.script, `AI: ${noteSnippet}`);
+      const truncate = (value: string) => (value.length > 72 ? `${value.slice(0, 72)}…` : value);
+      const candidateName = message.suggestedName?.trim()
+        || (message.promptSummary ? `AI · ${truncate(message.promptSummary.trim())}` : '')
+        || (message.content?.trim() ? `AI · ${truncate(message.content.trim())}` : '');
+      const finalName = candidateName || 'AI suggestion';
+
+      await applyScriptPreview(message.script, { name: finalName });
     },
     [applyScriptPreview],
   );
@@ -701,7 +778,7 @@ const App = () => {
               type="url"
               value={aiConfig.baseUrl}
               onChange={(event) => setAiConfig({ ...aiConfig, baseUrl: event.target.value })}
-              placeholder="https://api.example.com/v1"
+              placeholder="https://openrouter.ai/api/v1"
             />
           </label>
           <label className="field">
@@ -764,13 +841,13 @@ const App = () => {
             {captureError && <p className="message error">{captureError}</p>}
             <div className="actions">
               <button
-                className="button primary"
+                className="chip-button primary"
                 onClick={handleStartCapture}
                 disabled={isCapturing || activeTabId === null}
               >
                 {hasCaptured ? 'Capture another element' : 'Capture element'}
               </button>
-              <button className="button ghost" onClick={handleStopCapture} disabled={!isCapturing}>
+              <button className="chip-button ghost" onClick={handleStopCapture} disabled={!isCapturing}>
                 Stop
               </button>
             </div>
@@ -778,111 +855,151 @@ const App = () => {
 
           <section className="card scripts-card">
             <div className="section-header">
-              <h2>Active scripts</h2>
+              <h2>Scripts</h2>
               <div className="section-actions">
                 <button
                   className="chip-button"
                   onClick={() => refreshActiveScripts().catch(() => undefined)}
                   disabled={isSyncingScripts}
                 >
-                  {isSyncingScripts ? 'Refreshing...' : 'Refresh'}
+                  {isSyncingScripts ? 'Refreshing…' : 'Refresh'}
                 </button>
               </div>
             </div>
             {scriptsError && <p className="message error">{scriptsError}</p>}
             {!scriptsError && activeScripts.length === 0 && !isSyncingScripts && (
-              <p className="empty-state">No active previews on this page yet.</p>
+              <p className="empty-state">No scripts saved for this page yet.</p>
             )}
             {!scriptsError && activeScripts.length > 0 && (
               <ul className="script-list">
-                {activeScripts.map((script) => (
-                  <li
-                    key={script.id}
-                    className={`script-item ${selectedScriptId === script.id ? 'script-item-selected' : ''}`}
-                  >
-                    <div className="script-item-top">
-                      <span className={`status-pill status-${script.status}`}>
-                        {script.status === 'applied'
-                          ? 'Active'
-                          : script.status === 'pending'
-                          ? 'Pending'
-                          : 'Failed'}
-                      </span>
-                      <span className="script-updated">{formatRelativeTime(script.updatedAt)}</span>
-                    </div>
-                    <p className="script-notes">{script.notes || 'No notes captured.'}</p>
-                    <code className="script-selector" title={script.selector}>
-                      {script.selector}
-                    </code>
-                    <div className="script-actions">
-                      <button className="chip-button" onClick={() => handleSelectScript(script)}>
-                        Manual edit
-                      </button>
-                      <button
-                        className="chip-button ghost"
-                        onClick={() => handleRemoveScript(script.id)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  </li>
-                ))}
+                {activeScripts.map((script) => {
+                  const isActive = script.status === 'applied' || script.status === 'pending';
+                  const isDisabled = script.status === 'disabled';
+                  const isErrored = script.status === 'failed';
+                  const toggleLabel = isActive ? 'On' : 'Off';
+                  const toggleDisabled = togglingScriptId === script.id || script.status === 'pending';
+
+                  return (
+                    <li
+                      key={script.id}
+                      className={`script-item ${selectedScriptId === script.id ? 'script-item-selected' : ''}`}
+                    >
+                      <div className="script-item-header">
+                        <button
+                          className={`script-toggle ${isActive ? 'script-toggle-on' : ''}`}
+                          type="button"
+                          onClick={() => handleToggleScript(script, !isActive)}
+                          disabled={toggleDisabled}
+                        >
+                          <span className="script-toggle-thumb" />
+                          <span className="script-toggle-label">{toggleDisabled ? '…' : toggleLabel}</span>
+                        </button>
+                        <div className="script-item-info">
+                          <span className="script-name">{script.name?.trim() || 'Untitled script'}</span>
+                          <span className="script-selector" title={script.selector}>
+                            {script.selector}
+                          </span>
+                        </div>
+                        <div className="script-meta">
+                          {isErrored && <span className="script-status script-status-error">Error</span>}
+                          {isDisabled && !isErrored && (
+                            <span className="script-status script-status-off">Off</span>
+                          )}
+                          {isActive && !isErrored && (
+                            <span className="script-status script-status-on">On</span>
+                          )}
+                          <span className="script-updated">{formatRelativeTime(script.updatedAt)}</span>
+                        </div>
+                      </div>
+                      {script.errorMessage && (
+                        <p className="message error">{script.errorMessage}</p>
+                      )}
+                      <div className="script-actions">
+                        <button
+                          className="chip-button"
+                          onClick={() => {
+                            handleSelectScript(script);
+                            setManualEditorOpen(true);
+                          }}
+                        >
+                          Edit manually
+                        </button>
+                        <button
+                          className="chip-button ghost"
+                          onClick={() => handleRemoveScript(script.id)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </section>
 
-          <section className="card editor-card">
-            <div className="section-header">
-              <h2>Manual preview</h2>
-              {selectedScript && (
-                <span
-                  className="section-subtitle"
-                  title={new Date(selectedScript.updatedAt).toLocaleString()}
-                >
-                  Editing script created {formatRelativeTime(selectedScript.updatedAt)}
-                </span>
-              )}
-            </div>
-            {!hasCaptured && (
-              <p className="empty-state">Capture an element to prime the editor.</p>
+          <section className={`card editor-card ${isManualEditorOpen ? 'editor-card-open' : ''}`}>
+            <button
+              type="button"
+              className="editor-toggle"
+              onClick={() => setManualEditorOpen((open) => !open)}
+            >
+              <span>Manual script editor</span>
+              <span>{isManualEditorOpen ? 'Hide' : 'Show'}</span>
+            </button>
+            {isManualEditorOpen && (
+              <>
+                <div className="editor-context">
+                  {selectedScript ? (
+                    <>
+                      <span className="editor-context-name">{selectedScript.name || 'Untitled script'}</span>
+                      <span className="editor-context-updated">
+                        Updated {formatRelativeTime(selectedScript.updatedAt)}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="editor-context-empty">Select a script to edit or capture a new target.</span>
+                  )}
+                </div>
+                <label className="field">
+                  <span>Script name</span>
+                  <input
+                    type="text"
+                    value={scriptName}
+                    onChange={(event) => setScriptName(event.target.value)}
+                    placeholder="Button tweak"
+                  />
+                </label>
+                <label className="field">
+                  <span>JavaScript</span>
+                  <textarea
+                    value={jsCode}
+                    onChange={(event) => setJsCode(event.target.value)}
+                    placeholder="Use the captured selector to manipulate the element."
+                    spellCheck={false}
+                  />
+                </label>
+                <label className="field">
+                  <span>CSS (optional)</span>
+                  <textarea
+                    value={cssCode}
+                    onChange={(event) => setCssCode(event.target.value)}
+                    placeholder="Temporary styles applied with the script."
+                    spellCheck={false}
+                  />
+                </label>
+                {previewError && <p className="message error">{previewError}</p>}
+                {previewInfo && !previewError && <p className="message success">{previewInfo}</p>}
+                <div className="actions">
+                  <button className="button primary" onClick={handleApplyPreview} disabled={isApplyingPreview}>
+                    {isApplyingPreview ? 'Applying…' : 'Apply preview'}
+                  </button>
+                  <button className="button ghost" onClick={handleClearPreview} disabled={!activePreviewId}>
+                    Remove preview
+                  </button>
+                </div>
+              </>
             )}
-            <label className="field">
-              <span>JavaScript</span>
-              <textarea
-                value={jsCode}
-                onChange={(event) => setJsCode(event.target.value)}
-                placeholder="Use context elements to manipulate the selection."
-                spellCheck={false}
-              />
-            </label>
-            <label className="field">
-              <span>CSS (optional)</span>
-              <textarea
-                value={cssCode}
-                onChange={(event) => setCssCode(event.target.value)}
-                placeholder="These rules apply while the preview is active."
-                spellCheck={false}
-              />
-            </label>
-            <label className="field">
-              <span>Notes</span>
-              <input
-                type="text"
-                value={notes}
-                onChange={(event) => setNotes(event.target.value)}
-                placeholder="Add context for this experiment."
-              />
-            </label>
-            {previewError && <p className="message error">{previewError}</p>}
-            {previewInfo && !previewError && <p className="message success">{previewInfo}</p>}
-            <div className="actions">
-              <button className="button primary" onClick={handleApplyPreview} disabled={isApplyingPreview}>
-                {isApplyingPreview ? 'Applying...' : 'Apply preview'}
-              </button>
-              <button className="button ghost" onClick={handleClearPreview} disabled={!activePreviewId}>
-                Remove preview
-              </button>
-            </div>
           </section>
 
           <section className="card ai-chat-card">

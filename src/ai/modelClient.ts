@@ -64,7 +64,7 @@ Always respond with JSON: { "jsCode": string, "cssCode"?: string, "urlMatchPatte
 The JavaScript should avoid external dependencies and must rely on the provided DOM selector context.`;
 
 const DEFAULT_TIMEOUT_MS = 20000;
-const DEFAULT_ENDPOINT_PATH = '/v1/chat/completions';
+const DEFAULT_ENDPOINT_PATH = 'chat/completions';
 
 const defaultDeps: ModelClientDeps = {
   fetch: (globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined) as typeof fetch,
@@ -86,12 +86,49 @@ const normaliseBaseUrl = (baseUrl: string): string => {
 
 const buildEndpoint = (baseUrl: string, path: string | undefined): string => {
   const normalised = normaliseBaseUrl(baseUrl);
-  const finalPath = path ?? DEFAULT_ENDPOINT_PATH;
+  const finalPath = (path ?? DEFAULT_ENDPOINT_PATH).trim();
+
+  if (!finalPath) {
+    throw new ModelClientError('Model endpoint path is empty.');
+  }
+
+  if (/^https?:\/\//i.test(finalPath)) {
+    return finalPath;
+  }
+
+  const baseWithTrailingSlash = normalised.endsWith('/') ? normalised : `${normalised}/`;
+  const relativePath = finalPath.startsWith('/') ? finalPath.slice(1) : finalPath;
+
   try {
-    return new URL(finalPath, normalised).toString();
+    return new URL(relativePath, baseWithTrailingSlash).toString();
   } catch (error) {
     throw new ModelClientError('Failed to construct model endpoint URL.', undefined, error);
   }
+};
+const extractMessageContent = (rawContent: unknown): string | null => {
+  if (typeof rawContent === 'string') {
+    return rawContent;
+  }
+
+  if (Array.isArray(rawContent)) {
+    const parts = rawContent
+      .map((segment) => {
+        if (!segment || typeof segment !== 'object') {
+          return '';
+        }
+        const candidate = (segment as { text?: string; content?: string }).text
+          ?? (segment as { text?: string; content?: string }).content;
+        return typeof candidate === 'string' ? candidate : '';
+      })
+      .filter((value) => value.trim().length > 0);
+
+    if (parts.length > 0) {
+      const combined = parts.join('\n').trim();
+      return combined.length > 0 ? combined : null;
+    }
+  }
+
+  return null;
 };
 
 const buildUserMessage = (prompt: string, context?: GenerateScriptContext): string => {
@@ -242,9 +279,9 @@ export const createModelClient = (
 
       const payload = json as any;
       const choice = payload?.choices?.[0];
-      const content = choice?.message?.content;
+      const content = extractMessageContent(choice?.message?.content);
 
-      if (typeof content !== 'string') {
+      if (!content) {
         throw new ModelClientError('Model response did not include completion text.', response.status, payload);
       }
 

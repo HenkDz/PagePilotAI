@@ -7,7 +7,7 @@ export const runtimeEnv = {
 };
 
 export const defaultAiProviderConfig = {
-  baseUrl: import.meta.env.VITE_PAGEPILOT_AI_BASE_URL?.trim() ?? '',
+  baseUrl: import.meta.env.VITE_PAGEPILOT_AI_BASE_URL?.trim() ?? 'https://openrouter.ai/api/v1',
   model: import.meta.env.VITE_PAGEPILOT_AI_MODEL?.trim() ?? 'gpt-4o-mini',
 };
 

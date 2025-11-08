@@ -5,7 +5,7 @@ import { createModelClient, ModelClientError } from '../src/ai/modelClient';
 import { buildGenerationParams } from '../src/ai/promptBuilder';
 import { JobManager } from '../src/ai/jobManager';
 import { validateGeneratedScript } from '../src/ai/scriptValidator';
-import { listTemporaryScripts, removeTemporaryScript, saveTemporaryScript } from '../src/storage/tempScriptStore';
+import { getTemporaryScript, listTemporaryScripts, removeTemporaryScript, saveTemporaryScript } from '../src/storage/tempScriptStore';
 import { loadAiProviderConfig } from '../src/storage/settingsStore';
 import { runtimeEnv } from '../src/shared/env';
 import { RuntimeMessageType } from '../src/shared/messages';
@@ -28,6 +28,8 @@ import type {
   TempScriptExecutionPayload,
   TempScriptListPayload,
   TempScriptRemovalPayload,
+  TempScriptTogglePayload,
+  TempScriptRenamePayload,
 } from '../src/shared/messages';
 
 const log = logger.child('background');
@@ -41,6 +43,31 @@ const createRequestId = () =>
     ? crypto.randomUUID()
     : `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
+const summarisePrompt = (prompt: string | undefined): string | undefined => {
+  if (!prompt?.trim()) {
+    return undefined;
+  }
+
+  const firstMeaningfulLine = prompt
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+
+  if (!firstMeaningfulLine) {
+    return undefined;
+  }
+
+  return firstMeaningfulLine.length > 72 ? `${firstMeaningfulLine.slice(0, 72)}…` : firstMeaningfulLine;
+};
+
+const composeSuggestedName = (summary: string | undefined): string | undefined => {
+  if (!summary?.trim()) {
+    return undefined;
+  }
+
+  return summary.startsWith('AI ·') ? summary : `AI · ${summary}`;
+};
+
 const buildAssistantMessage = (overrides: Partial<AiChatMessage>): AiChatMessage => ({
   id: createRequestId(),
   role: 'assistant',
@@ -52,6 +79,8 @@ const buildAssistantMessage = (overrides: Partial<AiChatMessage>): AiChatMessage
   finishReason: overrides.finishReason,
   error: overrides.error,
   warnings: overrides.warnings,
+  suggestedName: overrides.suggestedName,
+  promptSummary: overrides.promptSummary,
 });
 
 const resolveTabId = (payloadTabId: number | undefined, senderTabId: number | undefined) => {
@@ -125,6 +154,7 @@ const buildTemporaryScript = async (
       : `temp-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     createdAt: now,
     updatedAt: now,
+    name: payload.name,
     selector: payload.selector,
     context,
     script: {
@@ -132,7 +162,6 @@ const buildTemporaryScript = async (
       cssCode: payload.cssCode,
     },
     status: 'pending',
-    notes: payload.notes,
   };
 };
 
@@ -194,6 +223,18 @@ const handleSelectorCaptured = async (
   capturedSelectors.set(tabId, payload);
   capturingTabs.delete(tabId);
   await broadcastSelectorState(tabId);
+
+  if (typeof browser.action?.openPopup === 'function') {
+    try {
+      await browser.action.openPopup();
+    } catch (error) {
+      log.debug('Unable to reopen popup after capture.', {
+        tabId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   return { ok: true } satisfies RuntimeResponse<unknown>;
 };
 
@@ -339,6 +380,106 @@ const handleTempScriptRemove = async (
   } satisfies RuntimeResponse<unknown>;
 };
 
+const handleTempScriptToggle = async (
+  payload: TempScriptTogglePayload,
+  senderTabId: number | undefined,
+): Promise<RuntimeResponse<{ script: TemporaryScript }>> => {
+  const tabId = resolveTabId(payload.tabId, senderTabId);
+  const script = await getTemporaryScript(payload.scriptId);
+
+  if (!script) {
+    return {
+      ok: false,
+      error: 'Script not found.',
+    } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+  }
+
+  script.updatedAt = Date.now();
+
+  if (payload.enabled) {
+    script.status = 'pending';
+    script.errorMessage = undefined;
+    await saveTemporaryScript(script);
+
+    try {
+      const response = await forwardToTab(tabId, {
+        type: RuntimeMessageType.TempScriptExecute,
+        payload: { script } satisfies TempScriptExecutionPayload,
+      });
+
+      if (!response.ok) {
+        throw new Error(response.error ?? 'Script activation failed.');
+      }
+
+      script.status = 'applied';
+      script.updatedAt = Date.now();
+      await saveTemporaryScript(script);
+
+      return {
+        ok: true,
+        payload: { script },
+      } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+    } catch (error) {
+      script.status = 'failed';
+      script.errorMessage = error instanceof Error ? error.message : String(error);
+      script.updatedAt = Date.now();
+      await saveTemporaryScript(script);
+
+      return {
+        ok: false,
+        error: script.errorMessage,
+        payload: { script },
+      } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+    }
+  }
+
+  try {
+    await forwardToTab(tabId, {
+      type: RuntimeMessageType.TempScriptRevoke,
+      payload: { scriptId: payload.scriptId },
+    });
+  } catch (error) {
+    log.debug('Failed to notify content script about script disable.', {
+      tabId,
+      scriptId: payload.scriptId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  script.status = 'disabled';
+  script.updatedAt = Date.now();
+  await saveTemporaryScript(script);
+
+  return {
+    ok: true,
+    payload: { script },
+  } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+};
+
+const handleTempScriptRename = async (
+  payload: TempScriptRenamePayload,
+  senderTabId: number | undefined,
+): Promise<RuntimeResponse<{ script: TemporaryScript }>> => {
+  resolveTabId(payload.tabId, senderTabId);
+  const script = await getTemporaryScript(payload.scriptId);
+
+  if (!script) {
+    return {
+      ok: false,
+      error: 'Script not found.',
+    } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+  }
+
+  script.name = payload.name.trim();
+  script.updatedAt = Date.now();
+  await saveTemporaryScript(script);
+
+  return {
+    ok: true,
+    payload: { script },
+  } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+};
+
 const handleAiGenerate = async (
   payload: AiGenerateRequestPayload,
   senderTabId: number | undefined,
@@ -392,6 +533,8 @@ const handleAiGenerate = async (
   }
 
   const jobKey = `tab-${tabId}`;
+  const promptSummary = summarisePrompt(payload.prompt);
+  const suggestedName = composeSuggestedName(promptSummary);
 
   const jobResult = await aiJobManager.run(jobKey, async (signal) => {
     const startedAt = Date.now();
@@ -423,6 +566,8 @@ const handleAiGenerate = async (
         rawText: generation.rawText,
         finishReason: generation.finishReason,
         warnings: validation.warnings,
+        suggestedName,
+        promptSummary,
       });
 
       const telemetry: AiGenerationTelemetry = {
@@ -453,6 +598,7 @@ const handleAiGenerate = async (
       const message = buildAssistantMessage({
         content: reason,
         error: reason,
+        promptSummary,
       });
 
       if (error instanceof ModelClientError && error.details) {
@@ -506,6 +652,7 @@ const handleAiGenerate = async (
     const message = buildAssistantMessage({
       content: 'Request cancelled.',
       error: 'Request cancelled.',
+      promptSummary,
     });
     log.debug('AI generation cancelled.', {
       tabId,
@@ -528,6 +675,7 @@ const handleAiGenerate = async (
     message: buildAssistantMessage({
       content: error.message ?? 'AI generation failed.',
       error: error.message ?? 'AI generation failed.',
+      promptSummary,
     }),
   };
 
@@ -593,6 +741,10 @@ const handleRuntimeMessage = (
       return handleTempScriptList(message.payload as TempScriptListPayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptRemove:
       return handleTempScriptRemove(message.payload as TempScriptRemovalPayload, sender.tab?.id);
+    case RuntimeMessageType.TempScriptToggle:
+      return handleTempScriptToggle(message.payload as TempScriptTogglePayload, sender.tab?.id);
+    case RuntimeMessageType.TempScriptRename:
+      return handleTempScriptRename(message.payload as TempScriptRenamePayload, sender.tab?.id);
     case RuntimeMessageType.AiGenerate:
       return handleAiGenerate(message.payload as AiGenerateRequestPayload, sender.tab?.id);
     case RuntimeMessageType.AiCancel:

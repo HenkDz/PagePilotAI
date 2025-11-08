@@ -59,6 +59,7 @@ const createScript = (overrides: Partial<TemporaryScript> = {}): TemporaryScript
   id: overrides.id ?? `script-${Math.random().toString(36).slice(2, 8)}`,
   createdAt: overrides.createdAt ?? Date.now(),
   updatedAt: overrides.updatedAt ?? Date.now(),
+  name: overrides.name,
   selector: overrides.selector ?? '#target',
   context: overrides.context ?? {
     url: 'https://example.test',
@@ -68,7 +69,6 @@ const createScript = (overrides: Partial<TemporaryScript> = {}): TemporaryScript
     jsCode: 'console.log("preview")',
   },
   status: overrides.status ?? 'pending',
-  notes: overrides.notes,
   errorMessage: overrides.errorMessage,
 });
 
