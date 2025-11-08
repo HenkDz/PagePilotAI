@@ -98,6 +98,8 @@ const App = () => {
   const [jsCode, setJsCode] = useState('');
   const [cssCode, setCssCode] = useState('');
   const [scriptName, setScriptName] = useState('');
+  const [targetSelector, setTargetSelector] = useState('');
+  const [urlMatchPattern, setUrlMatchPattern] = useState('');
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewInfo, setPreviewInfo] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
@@ -105,6 +107,7 @@ const App = () => {
   const [scriptsError, setScriptsError] = useState<string | null>(null);
   const [isSyncingScripts, setIsSyncingScripts] = useState(false);
   const [selectedScriptId, setSelectedScriptId] = useState<string | null>(null);
+  const [selectedScriptSnapshot, setSelectedScriptSnapshot] = useState<TemporaryScript | null>(null);
   const [togglingScriptId, setTogglingScriptId] = useState<string | null>(null);
   const [aiConfig, setAiConfig] = useState<AiProviderConfig>(createEmptyConfig);
   const [configStatus, setConfigStatus] = useState<string | null>(null);
@@ -116,6 +119,9 @@ const App = () => {
   const [aiInput, setAiInput] = useState('');
   const [aiError, setAiError] = useState<string | null>(null);
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
+  const [allScripts, setAllScripts] = useState<TemporaryScript[]>([]);
+  const [isLoadingAllScripts, setIsLoadingAllScripts] = useState(false);
+  const [allScriptsError, setAllScriptsError] = useState<string | null>(null);
   const aiFeedRef = useRef<HTMLDivElement | null>(null);
   const lastSelectorIdRef = useRef<string | null>(null);
 
@@ -140,7 +146,8 @@ const App = () => {
   }, []);
 
   useEffect(() => {
-    const currentSelectorId = selectorState?.descriptor?.id ?? null;
+    const descriptor = selectorState?.descriptor;
+    const currentSelectorId = descriptor?.id ?? null;
 
     if (!currentSelectorId) {
       lastSelectorIdRef.current = null;
@@ -151,6 +158,10 @@ const App = () => {
       lastSelectorIdRef.current = currentSelectorId;
       setView('home');
       setManualEditorOpen(true);
+      if (descriptor?.selector) {
+        setTargetSelector(descriptor.selector);
+      }
+      setUrlMatchPattern('');
     }
   }, [selectorState, setManualEditorOpen, setView]);
 
@@ -242,6 +253,31 @@ const App = () => {
     [activeTabId],
   );
 
+  const fetchAllScripts = useCallback(async () => {
+    setIsLoadingAllScripts(true);
+    setAllScriptsError(null);
+    try {
+      const response = (await browser.runtime.sendMessage({
+        type: RuntimeMessageType.TempScriptListAll,
+        payload: {},
+      })) as { ok: boolean; payload?: { scripts: TemporaryScript[] }; error?: string };
+
+      if (!response?.ok || !response.payload) {
+        setAllScriptsError(response?.error ?? 'Unable to load scripts.');
+        setAllScripts([]);
+        return;
+      }
+
+      setAllScripts(response.payload.scripts);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : 'Unable to load scripts.';
+      setAllScriptsError(reason);
+      setAllScripts([]);
+    } finally {
+      setIsLoadingAllScripts(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (activeTabId !== null) {
       refreshActiveScripts(activeTabId).catch((error) => {
@@ -259,17 +295,22 @@ const App = () => {
   }, [view, activeTabId, refreshActiveScripts]);
 
   useEffect(() => {
+    if (view === 'settings') {
+      fetchAllScripts().catch((error: unknown) => {
+        console.warn('Failed to load script library.', error);
+      });
+    }
+  }, [view, fetchAllScripts]);
+
+  useEffect(() => {
     if (!selectedScriptId) {
       return;
     }
-    const exists = activeScripts.some((script) => script.id === selectedScriptId);
-    if (!exists) {
-      setSelectedScriptId(null);
-      setJsCode('');
-      setCssCode('');
-      setScriptName('');
+    const existing = activeScripts.find((script) => script.id === selectedScriptId);
+    if (existing && existing !== selectedScriptSnapshot) {
+      setSelectedScriptSnapshot(existing);
     }
-  }, [activeScripts, selectedScriptId]);
+  }, [activeScripts, selectedScriptId, selectedScriptSnapshot]);
 
   const hasCaptured = selectorState !== null;
   const selectorSummary = useMemo(() => {
@@ -278,11 +319,6 @@ const App = () => {
     }
     return selectorState.descriptor.previewText || selectorState.descriptor.selector;
   }, [selectorState]);
-
-  const selectedScript = useMemo(
-    () => activeScripts.find((script) => script.id === selectedScriptId) ?? null,
-    [activeScripts, selectedScriptId],
-  );
 
   const activeHostname = useMemo(() => {
     if (!activeTabUrl) {
@@ -299,19 +335,23 @@ const App = () => {
   const hasAiProvider = Boolean(aiConfig.apiKey && aiConfig.apiKey.trim());
 
   const applyScriptPreview = useCallback(
-    async (script: GeneratedScriptPayload, options?: { name?: string }) => {
+    async (script: GeneratedScriptPayload, options?: { name?: string; selector?: string; urlMatchPattern?: string }) => {
       if (activeTabId === null) {
         setPreviewError('Open a tab to apply preview.');
-        return;
-      }
-      if (!selectorState) {
-        setPreviewError('Capture a target element first.');
         return;
       }
       if (!script.jsCode?.trim() && !script.cssCode?.trim()) {
         setPreviewError('Generated script is empty.');
         return;
       }
+
+      const selectorCandidate = options?.selector?.trim() || selectorState?.descriptor.selector?.trim();
+      if (!selectorCandidate) {
+        setPreviewError('Provide a CSS selector before applying preview.');
+        return;
+      }
+
+      const patternCandidate = options?.urlMatchPattern?.trim() || script.urlMatchPattern?.trim();
 
       setPreviewError(null);
       setPreviewInfo(null);
@@ -335,10 +375,11 @@ const App = () => {
           type: RuntimeMessageType.TempScriptCreate,
           payload: {
             tabId: activeTabId,
-            selector: selectorState.descriptor.selector,
+            selector: selectorCandidate,
             jsCode: script.jsCode,
             cssCode: script.cssCode,
             name: options?.name,
+            urlMatchPattern: patternCandidate,
           },
         })) as { ok: boolean; payload?: TemporaryScript; error?: string };
 
@@ -347,31 +388,50 @@ const App = () => {
           return;
         }
 
-        setActivePreviewId(response.payload.id);
+        setActivePreviewId(response.payload.status === 'applied' ? response.payload.id : null);
         setPreviewInfo('Preview applied.');
         setSelectedScriptId(response.payload.id);
-        setJsCode(script.jsCode ?? '');
-        setCssCode(script.cssCode ?? '');
+        setSelectedScriptSnapshot(response.payload);
+        setJsCode(response.payload.script.jsCode ?? '');
+        setCssCode(response.payload.script.cssCode ?? '');
         setScriptName(response.payload.name ?? options?.name ?? '');
+        setTargetSelector(response.payload.selector);
+        setUrlMatchPattern(response.payload.script.urlMatchPattern ?? '');
         await refreshActiveScripts();
+        if (view === 'settings') {
+          fetchAllScripts().catch((error: unknown) => {
+            console.warn('Failed to refresh library after preview apply.', error);
+          });
+        }
       } catch (error) {
         setPreviewError(error instanceof Error ? error.message : 'Preview failed to apply.');
       } finally {
         setIsApplyingPreview(false);
       }
     },
-    [activePreviewId, activeTabId, refreshActiveScripts, selectorState],
+    [activePreviewId, activeTabId, fetchAllScripts, refreshActiveScripts, selectorState, view],
   );
 
-  const handleSelectScript = (script: TemporaryScript) => {
+  const handleSelectScript = (script: TemporaryScript, options?: { source?: 'library' | 'active' }) => {
     setSelectedScriptId(script.id);
+    setSelectedScriptSnapshot(script);
     setJsCode(script.script.jsCode ?? '');
     setCssCode(script.script.cssCode ?? '');
     setScriptName(script.name ?? '');
-    setActivePreviewId(script.id);
+    setTargetSelector(script.selector);
+    setUrlMatchPattern(script.script.urlMatchPattern ?? '');
+    const isActiveScript = script.status === 'applied' || script.status === 'pending';
+    if (options?.source !== 'library') {
+      setActivePreviewId(isActiveScript ? script.id : null);
+    }
     setPreviewError(null);
     setPreviewInfo(null);
     setManualEditorOpen(true);
+  };
+
+  const handleOpenLibraryScript = (script: TemporaryScript) => {
+    setView('home');
+    handleSelectScript(script, { source: 'library' });
   };
 
   const handleStartCapture = async () => {
@@ -432,16 +492,28 @@ const App = () => {
       setActivePreviewId(null);
       if (selectedScriptId && selectedScriptId === activePreviewId) {
         setSelectedScriptId(null);
+        setSelectedScriptSnapshot(null);
+        setJsCode('');
+        setCssCode('');
+        setScriptName('');
+        setTargetSelector('');
+        setUrlMatchPattern('');
       }
       refreshActiveScripts().catch((refreshError) => {
         console.warn('Failed to refresh scripts after clearing preview.', refreshError);
       });
+      if (view === 'settings') {
+        fetchAllScripts().catch((error: unknown) => {
+          console.warn('Failed to refresh library after clearing preview.', error);
+        });
+      }
     }
   };
 
   const handleApplyPreview = async () => {
-    if (!hasCaptured) {
-      setPreviewError('Capture a target element first.');
+    const trimmedSelector = targetSelector.trim() || selectorState?.descriptor.selector?.trim();
+    if (!trimmedSelector) {
+      setPreviewError('Provide a CSS selector before applying preview.');
       return;
     }
     if (!jsCode.trim() && !cssCode.trim()) {
@@ -449,30 +521,45 @@ const App = () => {
       return;
     }
 
+    const trimmedPattern = urlMatchPattern.trim();
+
     await applyScriptPreview(
       {
         jsCode,
         cssCode: cssCode.trim() ? cssCode : undefined,
+        urlMatchPattern: trimmedPattern ? trimmedPattern : undefined,
       },
-      { name: scriptName.trim() || undefined },
+      {
+        name: scriptName.trim() || undefined,
+        selector: trimmedSelector,
+        urlMatchPattern: trimmedPattern ? trimmedPattern : undefined,
+      },
     );
   };
 
-  const handleRemoveScript = async (scriptId: string) => {
-    if (activeTabId === null) {
-      return;
-    }
-
+  const handleRemoveScript = async (scriptId: string, options?: { tabId?: number }) => {
+    const targetTabId = typeof options?.tabId === 'number' ? options.tabId : activeTabId;
     try {
+      const payload: { tabId?: number; scriptId: string } = { scriptId };
+      if (typeof targetTabId === 'number') {
+        payload.tabId = targetTabId;
+      }
+
       await browser.runtime.sendMessage({
         type: RuntimeMessageType.TempScriptRemove,
-        payload: { tabId: activeTabId, scriptId },
+        payload,
       });
       if (activePreviewId === scriptId) {
         setActivePreviewId(null);
       }
       if (selectedScriptId === scriptId) {
         setSelectedScriptId(null);
+        setSelectedScriptSnapshot(null);
+        setJsCode('');
+        setCssCode('');
+        setScriptName('');
+        setTargetSelector('');
+        setUrlMatchPattern('');
       }
       setPreviewInfo('Script removed.');
       setPreviewError(null);
@@ -482,6 +569,11 @@ const App = () => {
       refreshActiveScripts().catch((refreshError) => {
         console.warn('Failed to refresh scripts after removal.', refreshError);
       });
+      if (view === 'settings') {
+        fetchAllScripts().catch((error: unknown) => {
+          console.warn('Failed to refresh library after removal.', error);
+        });
+      }
     }
   };
 
@@ -509,6 +601,11 @@ const App = () => {
         }
 
         await refreshActiveScripts();
+        if (view === 'settings') {
+          fetchAllScripts().catch((error: unknown) => {
+            console.warn('Failed to refresh library after toggle.', error);
+          });
+        }
 
         const updated = response.payload?.script;
         if (response.ok && updated) {
@@ -527,6 +624,9 @@ const App = () => {
             setJsCode(updated.script.jsCode ?? '');
             setCssCode(updated.script.cssCode ?? '');
             setScriptName(updated.name ?? '');
+            setSelectedScriptSnapshot(updated);
+            setTargetSelector(updated.selector);
+            setUrlMatchPattern(updated.script.urlMatchPattern ?? '');
           }
         }
       } catch (error) {
@@ -535,7 +635,7 @@ const App = () => {
         setTogglingScriptId(null);
       }
     },
-    [activeTabId, refreshActiveScripts, activePreviewId, selectedScriptId],
+    [activeTabId, activePreviewId, fetchAllScripts, refreshActiveScripts, selectedScriptId, view],
   );
 
   const handleCaptureToggle = () => {
@@ -599,9 +699,16 @@ const App = () => {
         || (message.content?.trim() ? `AI · ${truncate(message.content.trim())}` : '');
       const finalName = candidateName || 'AI suggestion';
 
-      await applyScriptPreview(message.script, { name: finalName });
+      const selectorOverride = targetSelector.trim() || selectorState?.descriptor.selector?.trim();
+      const patternOverride = message.script.urlMatchPattern?.trim() || urlMatchPattern.trim() || undefined;
+
+      await applyScriptPreview(message.script, {
+        name: finalName,
+        selector: selectorOverride || undefined,
+        urlMatchPattern: patternOverride,
+      });
     },
-    [applyScriptPreview],
+    [applyScriptPreview, selectorState, targetSelector, urlMatchPattern],
   );
 
   const submitPrompt = useCallback(
@@ -767,60 +874,136 @@ const App = () => {
       </header>
 
       {view === 'settings' ? (
-        <section className="card settings-card">
-          <div className="section-header">
-            <h2>AI Provider</h2>
-            <span className="section-subtitle">Configure API access for assistants.</span>
-          </div>
-          <label className="field">
-            <span>Base URL</span>
-            <input
-              type="url"
-              value={aiConfig.baseUrl}
-              onChange={(event) => setAiConfig({ ...aiConfig, baseUrl: event.target.value })}
-              placeholder="https://openrouter.ai/api/v1"
-            />
-          </label>
-          <label className="field">
-            <span>API key</span>
-            <input
-              type="password"
-              value={aiConfig.apiKey ?? ''}
-              onChange={(event) => setAiConfig({ ...aiConfig, apiKey: event.target.value })}
-              placeholder="sk-***"
-            />
-          </label>
-          <label className="field">
-            <span>Model</span>
-            <input
-              type="text"
-              value={aiConfig.model}
-              onChange={(event) => setAiConfig({ ...aiConfig, model: event.target.value })}
-              placeholder="gpt-4o-mini"
-            />
-          </label>
-          {configStatus && (
-            <p
-              className={`message ${
-                configStatusTone === 'success'
-                  ? 'success'
-                  : configStatusTone === 'error'
-                  ? 'error'
-                  : 'muted'
-              }`}
-            >
-              {configStatus}
-            </p>
-          )}
-          <div className="actions">
-            <button className="button primary" onClick={handleSaveConfig} disabled={isSavingConfig}>
-              {isSavingConfig ? 'Saving...' : 'Save settings'}
-            </button>
-            <button className="button ghost" onClick={handleResetConfig} disabled={isSavingConfig}>
-              Reset
-            </button>
-          </div>
-        </section>
+        <>
+          <section className="card settings-card">
+            <div className="section-header">
+              <h2>AI Provider</h2>
+              <span className="section-subtitle">Configure API access for assistants.</span>
+            </div>
+            <label className="field">
+              <span>Base URL</span>
+              <input
+                type="url"
+                value={aiConfig.baseUrl}
+                onChange={(event) => setAiConfig({ ...aiConfig, baseUrl: event.target.value })}
+                placeholder="https://openrouter.ai/api/v1"
+              />
+            </label>
+            <label className="field">
+              <span>API key</span>
+              <input
+                type="password"
+                value={aiConfig.apiKey ?? ''}
+                onChange={(event) => setAiConfig({ ...aiConfig, apiKey: event.target.value })}
+                placeholder="sk-***"
+              />
+            </label>
+            <label className="field">
+              <span>Model</span>
+              <input
+                type="text"
+                value={aiConfig.model}
+                onChange={(event) => setAiConfig({ ...aiConfig, model: event.target.value })}
+                placeholder="gpt-4o-mini"
+              />
+            </label>
+            {configStatus && (
+              <p
+                className={`message ${
+                  configStatusTone === 'success'
+                    ? 'success'
+                    : configStatusTone === 'error'
+                    ? 'error'
+                    : 'muted'
+                }`}
+              >
+                {configStatus}
+              </p>
+            )}
+            <div className="actions">
+              <button className="button primary" onClick={handleSaveConfig} disabled={isSavingConfig}>
+                {isSavingConfig ? 'Saving...' : 'Save settings'}
+              </button>
+              <button className="button ghost" onClick={handleResetConfig} disabled={isSavingConfig}>
+                Reset
+              </button>
+            </div>
+          </section>
+
+          <section className="card settings-card">
+            <div className="section-header">
+              <h2>Script library</h2>
+              <div className="section-actions">
+                <button
+                  className="chip-button"
+                  onClick={() => fetchAllScripts().catch(() => undefined)}
+                  disabled={isLoadingAllScripts}
+                >
+                  {isLoadingAllScripts ? 'Refreshing…' : 'Refresh'}
+                </button>
+              </div>
+            </div>
+            <p className="section-subtitle">Browse and manage all saved PagePilot scripts.</p>
+            {allScriptsError && <p className="message error">{allScriptsError}</p>}
+            {!allScriptsError && allScripts.length === 0 && !isLoadingAllScripts && (
+              <p className="empty-state">No scripts saved yet.</p>
+            )}
+            {!allScriptsError && allScripts.length > 0 && (
+              <ul className="script-list">
+                {allScripts.map((script) => {
+                  const isActive = script.status === 'applied' || script.status === 'pending';
+                  const isDisabled = script.status === 'disabled';
+                  const isErrored = script.status === 'failed';
+
+                  return (
+                    <li key={script.id} className="script-item">
+                      <div className="script-item-header">
+                        <div className="script-item-info">
+                          <span className="script-name">{script.name?.trim() || 'Untitled script'}</span>
+                          <span className="script-selector" title={script.selector}>
+                            {script.selector}
+                          </span>
+                          {script.script.urlMatchPattern && (
+                            <span className="script-selector" title={script.script.urlMatchPattern}>
+                              {script.script.urlMatchPattern}
+                            </span>
+                          )}
+                        </div>
+                        <div className="script-meta">
+                          {isErrored && <span className="script-status script-status-error">Error</span>}
+                          {isDisabled && !isErrored && (
+                            <span className="script-status script-status-off">Off</span>
+                          )}
+                          {isActive && !isErrored && (
+                            <span className="script-status script-status-on">On</span>
+                          )}
+                          <span className="script-updated">{formatRelativeTime(script.updatedAt)}</span>
+                        </div>
+                      </div>
+                      {script.errorMessage && (
+                        <p className="message error">{script.errorMessage}</p>
+                      )}
+                      <div className="script-actions">
+                        <button
+                          className="chip-button"
+                          onClick={() => handleOpenLibraryScript(script)}
+                        >
+                          Open in editor
+                        </button>
+                        <button
+                          className="chip-button ghost"
+                          onClick={() => handleRemoveScript(script.id)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+        </>
       ) : (
         <>
           <section className="card overview-card">
@@ -899,6 +1082,11 @@ const App = () => {
                           <span className="script-selector" title={script.selector}>
                             {script.selector}
                           </span>
+                            {script.script.urlMatchPattern && (
+                              <span className="script-selector" title={script.script.urlMatchPattern}>
+                                {script.script.urlMatchPattern}
+                              </span>
+                            )}
                         </div>
                         <div className="script-meta">
                           {isErrored && <span className="script-status script-status-error">Error</span>}
@@ -917,10 +1105,7 @@ const App = () => {
                       <div className="script-actions">
                         <button
                           className="chip-button"
-                          onClick={() => {
-                            handleSelectScript(script);
-                            setManualEditorOpen(true);
-                          }}
+                          onClick={() => handleSelectScript(script)}
                         >
                           Edit manually
                         </button>
@@ -950,12 +1135,23 @@ const App = () => {
             {isManualEditorOpen && (
               <>
                 <div className="editor-context">
-                  {selectedScript ? (
+                  {selectedScriptSnapshot ? (
                     <>
-                      <span className="editor-context-name">{selectedScript.name || 'Untitled script'}</span>
+                      <span className="editor-context-name">{selectedScriptSnapshot.name || 'Untitled script'}</span>
                       <span className="editor-context-updated">
-                        Updated {formatRelativeTime(selectedScript.updatedAt)}
+                        Updated {formatRelativeTime(selectedScriptSnapshot.updatedAt)}
                       </span>
+                      <span className="script-selector" title={selectedScriptSnapshot.selector}>
+                        {selectedScriptSnapshot.selector}
+                      </span>
+                      {selectedScriptSnapshot.script.urlMatchPattern && (
+                        <span
+                          className="script-selector"
+                          title={selectedScriptSnapshot.script.urlMatchPattern}
+                        >
+                          {selectedScriptSnapshot.script.urlMatchPattern}
+                        </span>
+                      )}
                     </>
                   ) : (
                     <span className="editor-context-empty">Select a script to edit or capture a new target.</span>
@@ -968,6 +1164,24 @@ const App = () => {
                     value={scriptName}
                     onChange={(event) => setScriptName(event.target.value)}
                     placeholder="Button tweak"
+                  />
+                </label>
+                <label className="field">
+                  <span>Target selector</span>
+                  <input
+                    type="text"
+                    value={targetSelector}
+                    onChange={(event) => setTargetSelector(event.target.value)}
+                    placeholder=".hero button"
+                  />
+                </label>
+                <label className="field">
+                  <span>URL match pattern (optional)</span>
+                  <input
+                    type="text"
+                    value={urlMatchPattern}
+                    onChange={(event) => setUrlMatchPattern(event.target.value)}
+                    placeholder="https://example.com/*"
                   />
                 </label>
                 <label className="field">

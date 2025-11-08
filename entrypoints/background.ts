@@ -27,6 +27,7 @@ import type {
   TempScriptCreatePayload,
   TempScriptExecutionPayload,
   TempScriptListPayload,
+  TempScriptListAllPayload,
   TempScriptRemovalPayload,
   TempScriptTogglePayload,
   TempScriptRenamePayload,
@@ -36,6 +37,67 @@ import type {
 } from '../src/shared/messages';
 
 const log = logger.child('background');
+
+type MatchPatternConstructor = new (pattern: string) => {
+  test?: (value: string) => boolean;
+  matches?: (value: string) => boolean;
+};
+
+const matchPatternCache = new Map<string, RegExp>();
+
+const buildRegexFromPattern = (pattern: string): RegExp | null => {
+  if (pattern === '<all_urls>') {
+    return /.*/i;
+  }
+
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  const normalized = escaped.replace(/\*/g, '.*');
+  return new RegExp(`^${normalized}$`, 'i');
+};
+
+const matchesUrlPattern = (pattern: string, url: string): boolean => {
+  const trimmed = pattern.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed === '<all_urls>') {
+    return true;
+  }
+
+  try {
+    const runtimeWithPattern = browser.runtime as typeof browser.runtime & {
+      MatchPattern?: MatchPatternConstructor;
+    };
+    if (typeof runtimeWithPattern?.MatchPattern === 'function') {
+      const matcher = new runtimeWithPattern.MatchPattern(trimmed);
+      if (typeof matcher.test === 'function') {
+        return matcher.test(url);
+      }
+      if (typeof matcher.matches === 'function') {
+        return matcher.matches(url);
+      }
+    }
+  } catch (error) {
+    log.debug('Runtime match pattern evaluation failed; falling back to manual matching.', {
+      pattern: trimmed,
+      url,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const cached = matchPatternCache.get(trimmed);
+  if (cached) {
+    return cached.test(url);
+  }
+
+  const regex = buildRegexFromPattern(trimmed);
+  if (!regex) {
+    return false;
+  }
+
+  matchPatternCache.set(trimmed, regex);
+  return regex.test(url);
+};
 
 const capturedSelectors = new Map<number, CapturedSelectorState>();
 const capturingTabs = new Set<number>();
@@ -159,6 +221,8 @@ const buildTemporaryScript = async (
     surroundingHtml: capturedContext?.surroundingHtml,
   };
 
+  const trimmedPattern = payload.urlMatchPattern?.trim();
+
   if (!context.url) {
     try {
       const tab = await browser.tabs.get(tabId);
@@ -184,6 +248,7 @@ const buildTemporaryScript = async (
     script: {
       jsCode: payload.jsCode,
       cssCode: payload.cssCode,
+      urlMatchPattern: trimmedPattern ? trimmedPattern : undefined,
     },
     status: 'pending',
   };
@@ -358,23 +423,44 @@ const handleTempScriptList = async (
 
   const filtered = scripts
     .filter((script) => {
-      if (!script.context?.url) {
-        return false;
-      }
-
-      if (origin) {
+      const pattern = script.script.urlMatchPattern?.trim();
+      if (pattern && tabUrl) {
         try {
-          return new URL(script.context.url).origin === origin;
+          if (matchesUrlPattern(pattern, tabUrl)) {
+            return true;
+          }
         } catch (error) {
-          log.debug('Script url origin parsing failed.', {
+          log.debug('URL match pattern evaluation failed.', {
             scriptId: script.id,
-            scriptUrl: script.context.url,
+            pattern,
+            tabUrl,
             error: error instanceof Error ? error.message : String(error),
           });
         }
       }
 
-      return tabUrl ? script.context.url === tabUrl : false;
+      const scriptUrl = script.context?.url;
+      if (!scriptUrl || !tabUrl) {
+        return false;
+      }
+
+      if (scriptUrl === tabUrl) {
+        return true;
+      }
+
+      if (origin) {
+        try {
+          return new URL(scriptUrl).origin === origin;
+        } catch (error) {
+          log.debug('Script url origin parsing failed.', {
+            scriptId: script.id,
+            scriptUrl,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      return false;
     })
     .sort((a, b) => b.updatedAt - a.updatedAt);
 
@@ -384,23 +470,39 @@ const handleTempScriptList = async (
   } satisfies RuntimeResponse<{ scripts: TemporaryScript[] }>;
 };
 
+const handleTempScriptListAll = async (
+  payload: TempScriptListAllPayload | undefined,
+): Promise<RuntimeResponse<{ scripts: TemporaryScript[] }>> => {
+  const scripts = await listTemporaryScripts();
+  const includeDisabled = payload?.includeDisabled ?? true;
+  const filtered = includeDisabled ? scripts : scripts.filter((script) => script.status !== 'disabled');
+  const sorted = filtered.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+
+  return {
+    ok: true,
+    payload: { scripts: sorted },
+  } satisfies RuntimeResponse<{ scripts: TemporaryScript[] }>;
+};
+
 const handleTempScriptRemove = async (
   payload: TempScriptRemovalPayload,
   senderTabId: number | undefined,
 ) => {
-  const tabId = resolveTabId(payload.tabId, senderTabId);
+  const tabId = typeof payload.tabId === 'number' ? payload.tabId : senderTabId;
 
-  try {
-    await forwardToTab(tabId, {
-      type: RuntimeMessageType.TempScriptRevoke,
-      payload: { scriptId: payload.scriptId },
-    });
-  } catch (error) {
-    log.warn('Failed to revoke temp script on content script.', {
-      tabId,
-      scriptId: payload.scriptId,
-      error: error instanceof Error ? error.message : String(error),
-    });
+  if (typeof tabId === 'number') {
+    try {
+      await forwardToTab(tabId, {
+        type: RuntimeMessageType.TempScriptRevoke,
+        payload: { scriptId: payload.scriptId },
+      });
+    } catch (error) {
+      log.warn('Failed to revoke temp script on content script.', {
+        tabId,
+        scriptId: payload.scriptId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   await removeTemporaryScript(payload.scriptId);
@@ -542,9 +644,8 @@ ${script.script.jsCode}
 
 const handleTempScriptRename = async (
   payload: TempScriptRenamePayload,
-  senderTabId: number | undefined,
+  _senderTabId: number | undefined,
 ): Promise<RuntimeResponse<{ script: TemporaryScript }>> => {
-  resolveTabId(payload.tabId, senderTabId);
   const script = await getTemporaryScript(payload.scriptId);
 
   if (!script) {
@@ -823,6 +924,8 @@ const handleRuntimeMessage = (
       return handleTempScriptCreate(message.payload as TempScriptCreatePayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptList:
       return handleTempScriptList(message.payload as TempScriptListPayload, sender.tab?.id);
+    case RuntimeMessageType.TempScriptListAll:
+      return handleTempScriptListAll(message.payload as TempScriptListAllPayload);
     case RuntimeMessageType.TempScriptRemove:
       return handleTempScriptRemove(message.payload as TempScriptRemovalPayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptToggle:

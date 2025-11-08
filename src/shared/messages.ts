@@ -1,4 +1,4 @@
-import type { PageContextSnapshot, SelectorDescriptor, TemporaryScript } from './types';
+import type { AiChatMessage, PageContextSnapshot, SelectorDescriptor, TemporaryScript } from './types';
 
 export enum RuntimeMessageType {
   Ping = 'runtime/ping',
@@ -10,6 +10,7 @@ export enum RuntimeMessageType {
   TempScriptCreate = 'temp-script/create',
   TempScriptExecute = 'temp-script/execute',
   TempScriptList = 'temp-script/list',
+  TempScriptListAll = 'temp-script/list-all',
   TempScriptRemove = 'temp-script/remove',
   TempScriptRevoke = 'temp-script/revoke',
   TempScriptToggle = 'temp-script/toggle',
@@ -19,12 +20,6 @@ export enum RuntimeMessageType {
   AiGenerate = 'ai/generate',
   AiCancel = 'ai/cancel',
 }
-import type {
-  AiChatMessage,
-  PageContextSnapshot,
-  SelectorDescriptor,
-  TemporaryScript,
-} from './types';
 
 export interface PingMessage {
   timestamp: number;
@@ -55,10 +50,11 @@ export interface TempScriptCreatePayload {
   jsCode: string;
   cssCode?: string;
   name?: string;
+  urlMatchPattern?: string;
 }
 
 export interface TempScriptRemovalPayload {
-  tabId: number;
+  tabId?: number;
   scriptId: string;
 }
 
@@ -69,7 +65,7 @@ export interface TempScriptTogglePayload {
 }
 
 export interface TempScriptRenamePayload {
-  tabId: number;
+  tabId?: number;
   scriptId: string;
   name: string;
 }
@@ -80,6 +76,10 @@ export interface TempScriptListPayload {
 
 export interface TempScriptListResult {
   scripts: TemporaryScript[];
+}
+
+export interface TempScriptListAllPayload {
+  includeDisabled?: boolean;
 }
 
 export interface TempScriptExecutionPayload {
@@ -130,6 +130,7 @@ export type RuntimePayloads = {
   [RuntimeMessageType.TempScriptCreate]: TempScriptCreatePayload;
   [RuntimeMessageType.TempScriptExecute]: TempScriptExecutionPayload;
   [RuntimeMessageType.TempScriptList]: TempScriptListPayload;
+  [RuntimeMessageType.TempScriptListAll]: TempScriptListAllPayload;
   [RuntimeMessageType.TempScriptRemove]: TempScriptRemovalPayload;
   [RuntimeMessageType.TempScriptRevoke]: TempScriptRevokePayload;
   [RuntimeMessageType.TempScriptToggle]: TempScriptTogglePayload;
