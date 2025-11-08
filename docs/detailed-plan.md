@@ -6,6 +6,8 @@ This document lays out an incremental delivery roadmap that keeps extension cont
 
 ## Phase 0 – Project Enablement (1-2 sprints)
 
+Status: [x] Complete – baseline utilities, IndexedDB bootstrap, and tooling in place.
+
 **Summary:** Establish a predictable extension baseline, shared tooling, and product assumptions so future iterations plug into a stable foundation.
 
 - **Goals**
@@ -26,6 +28,8 @@ This document lays out an incremental delivery roadmap that keeps extension cont
 
 ## Phase 1 – Selector Capture & Sandbox Injection (2-3 sprints)
 
+Status: [~] In progress – selector heuristics, messaging, and preview sandbox covered by tests.
+
 **Summary:** Ship the non-AI editing loop: capture DOM targets, inject temporary scripts, and persist session state via IndexedDB.
 
 - **Goals**
@@ -44,6 +48,8 @@ This document lays out an incremental delivery roadmap that keeps extension cont
 ---
 
 ## Phase 2 – AI-Assisted Editing Loop (3-4 sprints)
+
+Status: [ ] Not started.
 
 **Summary:** Layer in AI chat flow that generates sandboxed scripts using configurable OpenAI-compatible endpoints while reusing Phase 1 plumbing.
 
@@ -65,6 +71,8 @@ This document lays out an incremental delivery roadmap that keeps extension cont
 
 ## Phase 3 – Persistence, History, and Robustness (3-4 sprints)
 
+Status: [ ] Not started.
+
 **Summary:** Convert the sandbox into a durable rule engine with history, healing, and diagnostics so users can rely on saved automations.
 
 - **Goals**
@@ -84,6 +92,8 @@ This document lays out an incremental delivery roadmap that keeps extension cont
 ---
 
 ## Phase 4 – Security, Monetization, and Scale (ongoing)
+
+Status: [ ] Not started.
 
 **Summary:** Prepare for broader release by tightening security, introducing freemium controls, and planning for backend expansion if needed.
 
