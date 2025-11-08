@@ -30,6 +30,9 @@ import type {
   TempScriptRemovalPayload,
   TempScriptTogglePayload,
   TempScriptRenamePayload,
+  TempScriptModuleCreatePayload,
+  TempScriptModuleCreateResult,
+  TempScriptModuleReleasePayload,
 } from '../src/shared/messages';
 
 const log = logger.child('background');
@@ -37,6 +40,27 @@ const log = logger.child('background');
 const capturedSelectors = new Map<number, CapturedSelectorState>();
 const capturingTabs = new Set<number>();
 const aiJobManager = new JobManager<{ response: AiGenerateResponsePayload; telemetry: AiGenerationTelemetry }>();
+const tempScriptModules = new Map<string, { url: string }>();
+
+const createScriptModule = (scriptId: string, source: string) => {
+  const existing = tempScriptModules.get(scriptId);
+  if (existing) {
+    URL.revokeObjectURL(existing.url);
+  }
+
+  const blob = new Blob([source], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  tempScriptModules.set(scriptId, { url });
+  return url;
+};
+
+const releaseScriptModule = (scriptId: string) => {
+  const existing = tempScriptModules.get(scriptId);
+  if (existing) {
+    URL.revokeObjectURL(existing.url);
+    tempScriptModules.delete(scriptId);
+  }
+};
 
 const createRequestId = () =>
   typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -260,10 +284,15 @@ const handleTempScriptCreate = async (
 
   await saveTemporaryScript(script);
 
+  const moduleSource = `export default async (context) => {
+${payload.jsCode}
+};`;
+  const moduleUrl = createScriptModule(script.id, moduleSource);
+
   try {
     const response = await forwardToTab(tabId, {
       type: RuntimeMessageType.TempScriptExecute,
-      payload: { script } satisfies TempScriptExecutionPayload,
+      payload: { script, moduleUrl } satisfies TempScriptExecutionPayload,
     });
 
     if (!response.ok) {
@@ -279,6 +308,7 @@ const handleTempScriptCreate = async (
       payload: script,
     } satisfies RuntimeResponse<TemporaryScript>;
   } catch (error) {
+    releaseScriptModule(script.id);
     script.status = 'failed';
     script.updatedAt = Date.now();
     script.errorMessage = error instanceof Error ? error.message : String(error);
@@ -374,10 +404,57 @@ const handleTempScriptRemove = async (
   }
 
   await removeTemporaryScript(payload.scriptId);
+  releaseScriptModule(payload.scriptId);
 
   return {
     ok: true,
   } satisfies RuntimeResponse<unknown>;
+};
+
+const handleTempScriptModuleCreate = (
+  payload: TempScriptModuleCreatePayload,
+): RuntimeResponse<TempScriptModuleCreateResult> => {
+  try {
+    const existing = tempScriptModules.get(payload.scriptId);
+    if (existing) {
+      URL.revokeObjectURL(existing.url);
+      tempScriptModules.delete(payload.scriptId);
+    }
+
+    const blob = new Blob([payload.source], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    tempScriptModules.set(payload.scriptId, { url });
+
+    return {
+      ok: true,
+      payload: { url },
+    } satisfies RuntimeResponse<TempScriptModuleCreateResult>;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: reason,
+    } satisfies RuntimeResponse<TempScriptModuleCreateResult>;
+  }
+};
+
+const handleTempScriptModuleRelease = (
+  payload: TempScriptModuleReleasePayload,
+): RuntimeResponse<{ released: boolean }> => {
+  const existing = tempScriptModules.get(payload.scriptId);
+  if (existing) {
+    URL.revokeObjectURL(existing.url);
+    tempScriptModules.delete(payload.scriptId);
+    return {
+      ok: true,
+      payload: { released: true },
+    } satisfies RuntimeResponse<{ released: boolean }>;
+  }
+
+  return {
+    ok: true,
+    payload: { released: false },
+  } satisfies RuntimeResponse<{ released: boolean }>;
 };
 
 const handleTempScriptToggle = async (
@@ -401,10 +478,15 @@ const handleTempScriptToggle = async (
     script.errorMessage = undefined;
     await saveTemporaryScript(script);
 
+    const moduleSource = `export default async (context) => {
+${script.script.jsCode}
+};`;
+    const moduleUrl = createScriptModule(script.id, moduleSource);
+
     try {
       const response = await forwardToTab(tabId, {
         type: RuntimeMessageType.TempScriptExecute,
-        payload: { script } satisfies TempScriptExecutionPayload,
+        payload: { script, moduleUrl } satisfies TempScriptExecutionPayload,
       });
 
       if (!response.ok) {
@@ -420,6 +502,7 @@ const handleTempScriptToggle = async (
         payload: { script },
       } satisfies RuntimeResponse<{ script: TemporaryScript }>;
     } catch (error) {
+      releaseScriptModule(script.id);
       script.status = 'failed';
       script.errorMessage = error instanceof Error ? error.message : String(error);
       script.updatedAt = Date.now();
@@ -449,6 +532,7 @@ const handleTempScriptToggle = async (
   script.status = 'disabled';
   script.updatedAt = Date.now();
   await saveTemporaryScript(script);
+  releaseScriptModule(script.id);
 
   return {
     ok: true,
@@ -745,6 +829,10 @@ const handleRuntimeMessage = (
       return handleTempScriptToggle(message.payload as TempScriptTogglePayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptRename:
       return handleTempScriptRename(message.payload as TempScriptRenamePayload, sender.tab?.id);
+    case RuntimeMessageType.TempScriptModuleCreate:
+      return Promise.resolve(handleTempScriptModuleCreate(message.payload as TempScriptModuleCreatePayload));
+    case RuntimeMessageType.TempScriptModuleRelease:
+      return Promise.resolve(handleTempScriptModuleRelease(message.payload as TempScriptModuleReleasePayload));
     case RuntimeMessageType.AiGenerate:
       return handleAiGenerate(message.payload as AiGenerateRequestPayload, sender.tab?.id);
     case RuntimeMessageType.AiCancel:

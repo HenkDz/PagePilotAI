@@ -165,8 +165,8 @@ export const stopCapture = () => {
   log.debug('Selector capture stopped.');
 };
 
-const applyTemporaryScript = async (script: TemporaryScript) => {
-  await applyPreviewScript(script);
+const applyTemporaryScript = async (script: TemporaryScript, moduleUrl?: string) => {
+  await applyPreviewScript(script, { moduleUrl });
   return {
     ok: true,
   } as const;
@@ -191,8 +191,8 @@ const handleRuntimeMessage = (
       return Promise.resolve({ ok: true });
     case RuntimeMessageType.TempScriptExecute:
       try {
-        const payload = message.payload as { script: TemporaryScript };
-        return applyTemporaryScript(payload.script).catch((error: unknown) => {
+        const payload = message.payload as { script: TemporaryScript; moduleUrl?: string };
+        return applyTemporaryScript(payload.script, payload.moduleUrl).catch((error: unknown) => {
           const reason = error instanceof Error ? error.message : String(error);
           return { ok: false, error: reason };
         });

@@ -14,6 +14,8 @@ export enum RuntimeMessageType {
   TempScriptRevoke = 'temp-script/revoke',
   TempScriptToggle = 'temp-script/toggle',
   TempScriptRename = 'temp-script/rename',
+  TempScriptModuleCreate = 'temp-script/module/create',
+  TempScriptModuleRelease = 'temp-script/module/release',
   AiGenerate = 'ai/generate',
   AiCancel = 'ai/cancel',
 }
@@ -82,9 +84,23 @@ export interface TempScriptListResult {
 
 export interface TempScriptExecutionPayload {
   script: TemporaryScript;
+  moduleUrl?: string;
 }
 
 export interface TempScriptRevokePayload {
+  scriptId: string;
+}
+
+export interface TempScriptModuleCreatePayload {
+  scriptId: string;
+  source: string;
+}
+
+export interface TempScriptModuleCreateResult {
+  url: string;
+}
+
+export interface TempScriptModuleReleasePayload {
   scriptId: string;
 }
 
@@ -118,6 +134,8 @@ export type RuntimePayloads = {
   [RuntimeMessageType.TempScriptRevoke]: TempScriptRevokePayload;
   [RuntimeMessageType.TempScriptToggle]: TempScriptTogglePayload;
   [RuntimeMessageType.TempScriptRename]: TempScriptRenamePayload;
+  [RuntimeMessageType.TempScriptModuleCreate]: TempScriptModuleCreatePayload;
+  [RuntimeMessageType.TempScriptModuleRelease]: TempScriptModuleReleasePayload;
   [RuntimeMessageType.AiGenerate]: AiGenerateRequestPayload;
   [RuntimeMessageType.AiCancel]: AiCancelRequestPayload;
 };
