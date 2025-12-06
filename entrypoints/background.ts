@@ -1060,6 +1060,18 @@ const handleAiGenerate = async (
     } satisfies RuntimeResponse<AiGenerateResponsePayload>;
   }
 
+  if (!aiConfig.apiKey?.trim()) {
+    const message = buildAssistantMessage({
+      content: 'Add your AI provider API key in settings before using PagePilot AI.',
+      error: 'API key missing.',
+    });
+    return {
+      ok: false,
+      error: 'API key missing.',
+      payload: { requestId, message },
+    } satisfies RuntimeResponse<AiGenerateResponsePayload>;
+  }
+
   const jobKey = `tab-${tabId}`;
   const promptSummary = summarisePrompt(payload.prompt);
   const suggestedName = composeSuggestedName(promptSummary);

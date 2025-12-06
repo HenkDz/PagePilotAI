@@ -8,6 +8,7 @@ import type {
   AiProviderConfig,
   CapturedSelectorState,
   GeneratedScriptPayload,
+  GeneratedScriptPayload,
   RuntimeMessage,
   RuntimeResponse,
   TemporaryScript,
@@ -202,6 +203,24 @@ const RefreshIcon = () => (
   </svg>
 );
 
+const parseScriptFromContent = (content: string | undefined): GeneratedScriptPayload | null => {
+  if (!content || !content.includes('jsCode')) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(content);
+    const jsCode = typeof parsed.jsCode === 'string' ? parsed.jsCode : '';
+    const cssCode = typeof parsed.cssCode === 'string' ? parsed.cssCode : undefined;
+    const urlMatchPattern = typeof parsed.urlMatchPattern === 'string' ? parsed.urlMatchPattern : undefined;
+    if (!jsCode.trim()) {
+      return null;
+    }
+    return { jsCode, cssCode: cssCode?.trim() ? cssCode : undefined, urlMatchPattern: urlMatchPattern?.trim() ? urlMatchPattern : undefined };
+  } catch {
+    return null;
+  }
+};
+
 const SidepanelApp = () => {
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
   const [activeTabUrl, setActiveTabUrl] = useState<string | null>(null);
@@ -246,12 +265,26 @@ const SidepanelApp = () => {
 
   const aiFeedRef = useRef<HTMLDivElement | null>(null);
   const lastSelectorIdRef = useRef<string | null>(null);
+  const lastActiveTabIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (aiFeedRef.current) {
       aiFeedRef.current.scrollTop = aiFeedRef.current.scrollHeight;
     }
   }, [aiConversation]);
+
+  const resetEditorState = useCallback(() => {
+    setSelectedScriptId(null);
+    setSelectedScriptSnapshot(null);
+    setActivePreviewId(null);
+    setJsCode('');
+    setCssCode('');
+    setScriptName('');
+    setTargetSelector('');
+    setUrlMatchPattern('');
+    setPreviewError(null);
+    setPreviewInfo(null);
+  }, []);
 
   const checkContentReady = useCallback(async () => {
     if (activeTabId === null) {
@@ -460,6 +493,26 @@ const SidepanelApp = () => {
       });
     }
   }, [activeTabId, refreshActiveScripts]);
+
+  useEffect(() => {
+    if (activeTabId === null) {
+      return;
+    }
+    if (lastActiveTabIdRef.current !== activeTabId) {
+      resetEditorState();
+    }
+    lastActiveTabIdRef.current = activeTabId;
+  }, [activeTabId, resetEditorState]);
+
+  useEffect(() => {
+    if (!selectedScriptId) {
+      return;
+    }
+    const existsInScope = activeScripts.some((script) => script.id === selectedScriptId);
+    if (!existsInScope) {
+      resetEditorState();
+    }
+  }, [activeScripts, selectedScriptId, resetEditorState]);
 
   useEffect(() => {
     if (!selectedScriptId) {
@@ -763,6 +816,22 @@ const SidepanelApp = () => {
     }
 
     const trimmedPattern = urlMatchPattern.trim();
+    const trimmedJs = jsCode.trim();
+
+    if (trimmedJs) {
+      try {
+        // Basic syntax validation to catch malformed user code before sending to background
+        // eslint-disable-next-line no-new-func
+        new Function(trimmedJs);
+      } catch (error) {
+        setPreviewError(
+          error instanceof Error
+            ? `JavaScript has a syntax error: ${error.message}`
+            : 'JavaScript has a syntax error.',
+        );
+        return;
+      }
+    }
 
     // If a script is selected, update it instead of creating a new one
     if (selectedScriptId) {
@@ -947,7 +1016,11 @@ const SidepanelApp = () => {
 
   const handlePreviewAiScript = useCallback(
     async (message: AiChatMessage) => {
-      if (!message.script) {
+      const script =
+        message.script
+        || parseScriptFromContent(message.content);
+
+      if (!script) {
         setAiError('AI response did not include a script to preview.');
         return;
       }
@@ -959,9 +1032,9 @@ const SidepanelApp = () => {
       const finalName = candidateName || 'AI suggestion';
 
       const selectorOverride = targetSelector.trim() || selectorState?.descriptor.selector?.trim();
-      const patternOverride = message.script.urlMatchPattern?.trim() || urlMatchPattern.trim() || undefined;
+      const patternOverride = script.urlMatchPattern?.trim() || urlMatchPattern.trim() || undefined;
 
-      await applyScriptPreview(message.script, {
+      await applyScriptPreview(script, {
         name: finalName,
         selector: selectorOverride || undefined,
         urlMatchPattern: patternOverride,
@@ -1527,7 +1600,8 @@ const SidepanelApp = () => {
                 ) : (
                   aiConversation.map((message) => {
                     const isUser = message.role === 'user';
-                    const cssSnippet = message.script?.cssCode?.trim();
+                    const scriptCandidate = message.script ?? parseScriptFromContent(message.content);
+                    const cssSnippet = scriptCandidate?.cssCode?.trim();
 
                     return (
                       <div
@@ -1543,7 +1617,7 @@ const SidepanelApp = () => {
                           <pre className="chat-text">{message.content}</pre>
                         )}
 
-                        {message.script && (
+                        {scriptCandidate && (
                           <div className="script-proposal">
                             <div className="script-proposal-header">
                               <span>Generated Script</span>
@@ -1551,7 +1625,7 @@ const SidepanelApp = () => {
                                 <span className="token-badge">{message.usage.totalTokens} tokens</span>
                               )}
                             </div>
-                            <pre className="script-code">{message.script.jsCode}</pre>
+                            <pre className="script-code">{scriptCandidate.jsCode}</pre>
                             {cssSnippet && (
                               <details className="css-details">
                                 <summary>CSS ({cssSnippet.split('\n').length} lines)</summary>
