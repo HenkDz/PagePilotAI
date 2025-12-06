@@ -1,4 +1,4 @@
-import type { AiChatMessage, PageContextSnapshot, SelectorDescriptor, TemporaryScript } from './types';
+import type { AiChatMessage, PageContextSnapshot, SelectorDescriptor, SelectorLevel, TemporaryScript } from './types';
 
 export enum RuntimeMessageType {
   Ping = 'runtime/ping',
@@ -7,6 +7,9 @@ export enum RuntimeMessageType {
   SelectorCaptured = 'selector/captured',
   SelectorGetActive = 'selector/get-active',
   SelectorPreviewUpdated = 'selector/preview-updated',
+  SelectorSetLevel = 'selector/set-level',
+  SelectorHighlight = 'selector/highlight',
+  SelectorClearHighlight = 'selector/clear-highlight',
   TempScriptCreate = 'temp-script/create',
   TempScriptExecute = 'temp-script/execute',
   TempScriptList = 'temp-script/list',
@@ -15,10 +18,12 @@ export enum RuntimeMessageType {
   TempScriptRevoke = 'temp-script/revoke',
   TempScriptToggle = 'temp-script/toggle',
   TempScriptRename = 'temp-script/rename',
+  TempScriptUpdate = 'temp-script/update',
   TempScriptModuleCreate = 'temp-script/module/create',
   TempScriptModuleRelease = 'temp-script/module/release',
   AiGenerate = 'ai/generate',
   AiCancel = 'ai/cancel',
+  GetActiveTab = 'tabs/get-active',
 }
 
 export interface PingMessage {
@@ -42,6 +47,18 @@ export interface SelectorPreviewState {
 
 export interface SelectorGetActivePayload {
   tabId: number;
+}
+
+export interface SelectorSetLevelPayload {
+  tabId: number;
+  level: SelectorLevel;
+  customSelector?: string;
+  classSelection?: string[];
+}
+
+export interface SelectorHighlightPayload {
+  tabId: number;
+  selector: string;
 }
 
 export interface TempScriptCreatePayload {
@@ -104,6 +121,16 @@ export interface TempScriptModuleReleasePayload {
   scriptId: string;
 }
 
+export interface TempScriptUpdatePayload {
+  scriptId: string;
+  jsCode: string;
+  cssCode?: string;
+  selector?: string;
+  urlMatchPattern?: string;
+  name?: string;
+  tabId?: number;
+}
+
 export interface AiGenerateRequestPayload {
   tabId: number;
   prompt: string;
@@ -120,6 +147,14 @@ export interface AiCancelRequestPayload {
   requestId?: string;
 }
 
+export interface GetActiveTabPayload {}
+
+export interface GetActiveTabResult {
+  tabId: number;
+  url: string;
+  title?: string;
+}
+
 export type RuntimePayloads = {
   [RuntimeMessageType.Ping]: PingMessage;
   [RuntimeMessageType.SelectorCaptureStart]: SelectorCaptureCommand;
@@ -127,6 +162,9 @@ export type RuntimePayloads = {
   [RuntimeMessageType.SelectorCaptured]: CapturedSelectorPayload;
   [RuntimeMessageType.SelectorGetActive]: SelectorGetActivePayload;
   [RuntimeMessageType.SelectorPreviewUpdated]: SelectorPreviewState;
+  [RuntimeMessageType.SelectorSetLevel]: SelectorSetLevelPayload;
+  [RuntimeMessageType.SelectorHighlight]: SelectorHighlightPayload;
+  [RuntimeMessageType.SelectorClearHighlight]: SelectorHighlightPayload;
   [RuntimeMessageType.TempScriptCreate]: TempScriptCreatePayload;
   [RuntimeMessageType.TempScriptExecute]: TempScriptExecutionPayload;
   [RuntimeMessageType.TempScriptList]: TempScriptListPayload;
@@ -135,8 +173,10 @@ export type RuntimePayloads = {
   [RuntimeMessageType.TempScriptRevoke]: TempScriptRevokePayload;
   [RuntimeMessageType.TempScriptToggle]: TempScriptTogglePayload;
   [RuntimeMessageType.TempScriptRename]: TempScriptRenamePayload;
+  [RuntimeMessageType.TempScriptUpdate]: TempScriptUpdatePayload;
   [RuntimeMessageType.TempScriptModuleCreate]: TempScriptModuleCreatePayload;
   [RuntimeMessageType.TempScriptModuleRelease]: TempScriptModuleReleasePayload;
   [RuntimeMessageType.AiGenerate]: AiGenerateRequestPayload;
   [RuntimeMessageType.AiCancel]: AiCancelRequestPayload;
+  [RuntimeMessageType.GetActiveTab]: GetActiveTabPayload;
 };

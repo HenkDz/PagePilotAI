@@ -33,14 +33,16 @@ export const validateGeneratedScript = (payload: GeneratedScriptPayload): Script
   const warnings: string[] = [];
 
   const jsCode = typeof payload.jsCode === 'string' ? payload.jsCode.trim() : '';
-  const cssCode = typeof payload.cssCode === 'string' ? payload.cssCode.trim() : undefined;
+  const cssCode = typeof payload.cssCode === 'string' ? payload.cssCode.trim() : '';
   const urlMatchPattern = typeof payload.urlMatchPattern === 'string'
     ? payload.urlMatchPattern.trim()
     : undefined;
 
-  if (!jsCode) {
-    errors.push('Generated response did not include JavaScript to execute.');
-  } else {
+  if (!jsCode && !cssCode) {
+    errors.push('Generated response did not include JavaScript or CSS to apply.');
+  }
+
+  if (jsCode) {
     if (jsCode.length > MAX_JS_LENGTH) {
       warnings.push(`JavaScript exceeds ${MAX_JS_LENGTH} characters; consider simplifying.`);
     }
@@ -53,7 +55,7 @@ export const validateGeneratedScript = (payload: GeneratedScriptPayload): Script
 
   return {
     ok: errors.length === 0,
-    script: errors.length === 0 ? { jsCode, cssCode, urlMatchPattern } : undefined,
+    script: errors.length === 0 ? { jsCode, cssCode: cssCode || undefined, urlMatchPattern } : undefined,
     errors,
     warnings,
   } satisfies ScriptValidationResult;

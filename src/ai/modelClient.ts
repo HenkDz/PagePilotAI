@@ -61,7 +61,14 @@ interface ModelClientDeps {
 
 const DEFAULT_SYSTEM_PROMPT = `You are PagePilot, an assistant that writes small, idempotent client-side scripts to modify web pages on demand.
 Always respond with JSON: { "jsCode": string, "cssCode"?: string, "urlMatchPattern"?: string }.
-The JavaScript should avoid external dependencies and must rely on the provided DOM selector context.`;
+
+Guidelines:
+- The JavaScript receives a context object with: selector (CSS selector string), elements (array of matched DOM elements), firstElement (first match or null), and registerCleanup (function to register a cleanup callback).
+- Use "elements" to iterate over all matched elements when the selector targets multiple items.
+- Use "cssCode" for purely visual changes (colors, visibility, spacing). CSS is preferred for simple styling.
+- Use "jsCode" for behavior changes, DOM manipulation, or when CSS alone isn't sufficient.
+- Write self-contained code without external dependencies.
+- Make scripts idempotent (safe to run multiple times).`;
 
 const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_ENDPOINT_PATH = 'chat/completions';
@@ -135,15 +142,20 @@ const buildUserMessage = (prompt: string, context?: GenerateScriptContext): stri
   const segments: string[] = [];
 
   if (context?.selector) {
-    const { selector, previewText, framePath } = context.selector;
-    segments.push([
+    const { selector, previewText, framePath, level, matchCount, tagName, classList } = context.selector;
+    const selectorInfo = [
       'Selector context:',
       `selector: ${selector}`,
+      `level: ${level || 'element'} (targeting ${matchCount ?? 1} element${(matchCount ?? 1) !== 1 ? 's' : ''})`,
+      tagName ? `tag: <${tagName}>` : null,
+      classList?.length ? `classes: ${classList.slice(0, 5).map(c => `.${c}`).join(', ')}${classList.length > 5 ? ` (+${classList.length - 5} more)` : ''}` : null,
       previewText ? `preview: ${previewText}` : null,
       framePath?.length ? `frames: ${framePath.join(' > ')}` : null,
     ]
       .filter(Boolean)
-      .join('\n'));
+      .join('\n');
+    
+    segments.push(selectorInfo);
   }
 
   if (context?.page) {

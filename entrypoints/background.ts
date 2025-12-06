@@ -24,6 +24,8 @@ import type {
   SelectorCaptureCommand,
   SelectorGetActivePayload,
   SelectorPreviewState,
+  SelectorSetLevelPayload,
+  SelectorHighlightPayload,
   TempScriptCreatePayload,
   TempScriptExecutionPayload,
   TempScriptListPayload,
@@ -31,9 +33,11 @@ import type {
   TempScriptRemovalPayload,
   TempScriptTogglePayload,
   TempScriptRenamePayload,
+  TempScriptUpdatePayload,
   TempScriptModuleCreatePayload,
   TempScriptModuleCreateResult,
   TempScriptModuleReleasePayload,
+  GetActiveTabResult,
 } from '../src/shared/messages';
 
 const log = logger.child('background');
@@ -44,6 +48,8 @@ type MatchPatternConstructor = new (pattern: string) => {
 };
 
 const matchPatternCache = new Map<string, RegExp>();
+let workspaceWindowId: number | null = null;
+const sidePanelPath = 'sidepanel/index.html';
 
 const buildRegexFromPattern = (pattern: string): RegExp | null => {
   if (pattern === '<all_urls>') {
@@ -103,25 +109,109 @@ const capturedSelectors = new Map<number, CapturedSelectorState>();
 const capturingTabs = new Set<number>();
 const aiJobManager = new JobManager<{ response: AiGenerateResponsePayload; telemetry: AiGenerationTelemetry }>();
 const tempScriptModules = new Map<string, { url: string }>();
-
-const createScriptModule = (scriptId: string, source: string) => {
-  const existing = tempScriptModules.get(scriptId);
-  if (existing) {
-    URL.revokeObjectURL(existing.url);
-  }
-
-  const blob = new Blob([source], { type: 'application/javascript' });
-  const url = URL.createObjectURL(blob);
-  tempScriptModules.set(scriptId, { url });
-  return url;
-};
+const tabScriptApplications = new Map<number, Set<string>>();
 
 const releaseScriptModule = (scriptId: string) => {
-  const existing = tempScriptModules.get(scriptId);
+  tempScriptModules.delete(scriptId);
+};
+
+const rememberApplication = (tabId: number, scriptId: string) => {
+  const existing = tabScriptApplications.get(tabId);
   if (existing) {
-    URL.revokeObjectURL(existing.url);
-    tempScriptModules.delete(scriptId);
+    existing.add(scriptId);
+    return;
   }
+  tabScriptApplications.set(tabId, new Set([scriptId]));
+};
+
+const clearTabApplications = (tabId: number) => {
+  tabScriptApplications.delete(tabId);
+};
+
+const openWorkspaceWindow = async () => {
+  const url = browser.runtime.getURL(sidePanelPath);
+  try {
+    // Reuse if already open
+    if (workspaceWindowId !== null) {
+      const existing = await browser.windows.get(workspaceWindowId).catch(() => undefined);
+      if (existing?.id !== undefined) {
+        await browser.windows.update(existing.id, { focused: true });
+        return;
+      }
+    }
+  } catch {
+    // swallow and create new window
+  }
+
+  const created = await browser.windows.create({
+    url,
+    type: 'popup',
+    width: 420,
+    height: 780,
+    focused: true,
+  });
+  if (created?.id !== undefined) {
+    workspaceWindowId = created.id;
+  }
+};
+
+const openSidePanel = async (windowId?: number) => {
+  const sidePanel = (browser as typeof browser & {
+    sidePanel?: {
+      setOptions?: (options: { path: string; enabled?: boolean; tabId?: number }) => Promise<void>;
+      open?: (options?: { windowId?: number }) => Promise<void>;
+    };
+  }).sidePanel;
+
+  if (sidePanel?.open) {
+    try {
+      const targetWindowId = windowId ?? (await browser.windows.getCurrent()).id;
+      await sidePanel.open({ windowId: targetWindowId });
+      return;
+    } catch (error) {
+      log.debug('Failed to open side panel via API.', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Fallback to standalone window if side panel API is unavailable.
+  await openWorkspaceWindow();
+};
+
+const handleWorkspaceWindowRemoved = (windowId: number) => {
+  if (workspaceWindowId === windowId) {
+    workspaceWindowId = null;
+  }
+};
+
+const findTabForScript = async (script: TemporaryScript): Promise<number | undefined> => {
+  try {
+    const tabs = await browser.tabs.query({});
+    const pattern = script.script.urlMatchPattern;
+    for (const tab of tabs) {
+      if (!tab.id || !tab.url) continue;
+      const url = tab.url;
+      if (pattern && matchesUrlPattern(pattern, url)) {
+        return tab.id;
+      }
+      try {
+        const scriptOrigin = script.context?.url ? new URL(script.context.url).origin : null;
+        const tabOrigin = new URL(url).origin;
+        if (scriptOrigin && scriptOrigin === tabOrigin) {
+          return tab.id;
+        }
+      } catch {
+        // ignore URL parse errors
+      }
+    }
+  } catch (error) {
+    log.debug('Failed to search tabs for script application.', {
+      scriptId: script.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return undefined;
 };
 
 const createRequestId = () =>
@@ -206,6 +296,104 @@ const forwardToTab = async (tabId: number, message: RuntimeMessage<RuntimeMessag
     throw new Error(
       error instanceof Error ? error.message : 'Failed to communicate with content script.',
     );
+  }
+};
+
+const injectScriptJs = async (tabId: number, scriptId: string, selector: string, jsCode: string) => {
+  if (!jsCode?.trim()) {
+    return;
+  }
+
+  // Build the code to inject - this runs in the ISOLATED world (content script context)
+  // which bypasses the page's CSP since it's extension code
+  const wrappedCode = `
+(async () => {
+  const scriptId = ${JSON.stringify(scriptId)};
+  const selector = ${JSON.stringify(selector)};
+  const elements = Array.from(document.querySelectorAll(selector));
+  
+  // Ensure cleanup registry exists
+  if (!window.__pagepilotCleanups) {
+    window.__pagepilotCleanups = new Map();
+  }
+  
+  const context = {
+    selector,
+    elements,
+    firstElement: elements[0] ?? null,
+    registerCleanup: (callback) => {
+      if (typeof callback === 'function') {
+        window.__pagepilotCleanups.set(scriptId, callback);
+      }
+    },
+    console,
+    document,
+    window,
+  };
+  
+  try {
+    ${jsCode}
+  } catch (error) {
+    console.warn('[PagePilot] Script execution error:', error);
+    throw error;
+  }
+})();
+`;
+
+  try {
+    await browser.scripting.executeScript({
+      target: { tabId },
+      func: (code: string) => {
+        // This runs in the ISOLATED world, so we can use Function safely
+        // The isolated world has its own CSP that allows eval
+        const fn = new Function(code);
+        return fn();
+      },
+      args: [wrappedCode],
+      world: 'ISOLATED',
+    });
+  } catch (error) {
+    log.warn('chrome.scripting.executeScript failed.', {
+      tabId,
+      scriptId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+};
+
+const applyScriptToTab = async (script: TemporaryScript, tabId: number): Promise<TemporaryScript> => {
+  script.status = 'pending';
+  script.errorMessage = undefined;
+  script.updatedAt = Date.now();
+  await saveTemporaryScript(script);
+
+  try {
+    // Forward to content script for CSS application and tracking
+    const response = await forwardToTab(tabId, {
+      type: RuntimeMessageType.TempScriptExecute,
+      payload: { script } satisfies TempScriptExecutionPayload,
+    });
+
+    if (!response.ok) {
+      throw new Error(response.error ?? 'Script activation failed.');
+    }
+
+    // Inject JS via chrome.scripting.executeScript (bypasses page CSP)
+    await injectScriptJs(tabId, script.id, script.selector, script.script.jsCode ?? '');
+
+    script.status = 'applied';
+    script.updatedAt = Date.now();
+    await saveTemporaryScript(script);
+    rememberApplication(tabId, script.id);
+    return script;
+  } catch (error) {
+    releaseScriptModule(script.id);
+    script.status = 'failed';
+    script.errorMessage = error instanceof Error ? error.message : String(error);
+    script.updatedAt = Date.now();
+    await saveTemporaryScript(script);
+    throw error;
   }
 };
 
@@ -313,17 +501,6 @@ const handleSelectorCaptured = async (
   capturingTabs.delete(tabId);
   await broadcastSelectorState(tabId);
 
-  if (typeof browser.action?.openPopup === 'function') {
-    try {
-      await browser.action.openPopup();
-    } catch (error) {
-      log.debug('Unable to reopen popup after capture.', {
-        tabId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
   return { ok: true } satisfies RuntimeResponse<unknown>;
 };
 
@@ -340,6 +517,99 @@ const handleSelectorGetActive = async (
   } satisfies RuntimeResponse<{ state?: CapturedSelectorState; isCapturing: boolean }>;
 };
 
+const handleSelectorSetLevel = async (
+  payload: SelectorSetLevelPayload,
+  senderTabId: number | undefined,
+) => {
+  const tabId = resolveTabId(payload.tabId, senderTabId);
+  
+  try {
+    const response = await forwardToTab(tabId, {
+      type: RuntimeMessageType.SelectorSetLevel,
+      payload,
+    }) as RuntimeResponse<CapturedSelectorState>;
+
+    if (response.ok && response.payload) {
+      capturedSelectors.set(tabId, response.payload);
+      await broadcastSelectorState(tabId);
+    }
+
+    return response;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: reason,
+    } satisfies RuntimeResponse<unknown>;
+  }
+};
+
+const handleSelectorHighlight = async (
+  payload: SelectorHighlightPayload,
+  senderTabId: number | undefined,
+) => {
+  const tabId = resolveTabId(payload.tabId, senderTabId);
+  
+  try {
+    return await forwardToTab(tabId, {
+      type: RuntimeMessageType.SelectorHighlight,
+      payload,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: reason,
+    } satisfies RuntimeResponse<unknown>;
+  }
+};
+
+const handleSelectorClearHighlight = async (
+  payload: SelectorHighlightPayload,
+  senderTabId: number | undefined,
+) => {
+  const tabId = resolveTabId(payload.tabId, senderTabId);
+  
+  try {
+    return await forwardToTab(tabId, {
+      type: RuntimeMessageType.SelectorClearHighlight,
+      payload,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: reason,
+    } satisfies RuntimeResponse<unknown>;
+  }
+};
+
+const handleGetActiveTab = async (): Promise<RuntimeResponse<GetActiveTabResult>> => {
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id || !tab.url) {
+      return {
+        ok: false,
+        error: 'No active tab found.',
+      };
+    }
+    return {
+      ok: true,
+      payload: {
+        tabId: tab.id,
+        url: tab.url,
+        title: tab.title,
+      },
+    };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: reason,
+    };
+  }
+};
+
 const handleTempScriptCreate = async (
   payload: TempScriptCreatePayload,
   senderTabId: number | undefined,
@@ -349,44 +619,22 @@ const handleTempScriptCreate = async (
 
   await saveTemporaryScript(script);
 
-  const moduleSource = `export default async (context) => {
-${payload.jsCode}
-};`;
-  const moduleUrl = createScriptModule(script.id, moduleSource);
-
   try {
-    const response = await forwardToTab(tabId, {
-      type: RuntimeMessageType.TempScriptExecute,
-      payload: { script, moduleUrl } satisfies TempScriptExecutionPayload,
-    });
-
-    if (!response.ok) {
-      throw new Error(response.error ?? 'Preview injection failed.');
-    }
-
-    script.status = 'applied';
-    script.updatedAt = Date.now();
-    await saveTemporaryScript(script);
+    const applied = await applyScriptToTab(script, tabId);
 
     return {
       ok: true,
-      payload: script,
+      payload: applied,
     } satisfies RuntimeResponse<TemporaryScript>;
   } catch (error) {
-    releaseScriptModule(script.id);
-    script.status = 'failed';
-    script.updatedAt = Date.now();
-    script.errorMessage = error instanceof Error ? error.message : String(error);
-    await saveTemporaryScript(script);
-
     log.warn('Temporary script injection failed.', {
       tabId,
-      error: script.errorMessage,
+      error: error instanceof Error ? error.message : String(error),
     });
 
     return {
       ok: false,
-      error: script.errorMessage,
+      error: error instanceof Error ? error.message : String(error),
     } satisfies RuntimeResponse<TemporaryScript>;
   }
 };
@@ -517,14 +765,7 @@ const handleTempScriptModuleCreate = (
   payload: TempScriptModuleCreatePayload,
 ): RuntimeResponse<TempScriptModuleCreateResult> => {
   try {
-    const existing = tempScriptModules.get(payload.scriptId);
-    if (existing) {
-      URL.revokeObjectURL(existing.url);
-      tempScriptModules.delete(payload.scriptId);
-    }
-
-    const blob = new Blob([payload.source], { type: 'application/javascript' });
-    const url = URL.createObjectURL(blob);
+    const url = `data:text/javascript;charset=utf-8,${encodeURIComponent(payload.source)}`;
     tempScriptModules.set(payload.scriptId, { url });
 
     return {
@@ -563,7 +804,6 @@ const handleTempScriptToggle = async (
   payload: TempScriptTogglePayload,
   senderTabId: number | undefined,
 ): Promise<RuntimeResponse<{ script: TemporaryScript }>> => {
-  const tabId = resolveTabId(payload.tabId, senderTabId);
   const script = await getTemporaryScript(payload.scriptId);
 
   if (!script) {
@@ -576,59 +816,47 @@ const handleTempScriptToggle = async (
   script.updatedAt = Date.now();
 
   if (payload.enabled) {
-    script.status = 'pending';
-    script.errorMessage = undefined;
-    await saveTemporaryScript(script);
+    let tabId = typeof payload.tabId === 'number' ? payload.tabId : senderTabId;
+    if (typeof tabId !== 'number') {
+      tabId = await findTabForScript(script);
+    }
 
-    const moduleSource = `export default async (context) => {
-${script.script.jsCode}
-};`;
-    const moduleUrl = createScriptModule(script.id, moduleSource);
-
-    try {
-      const response = await forwardToTab(tabId, {
-        type: RuntimeMessageType.TempScriptExecute,
-        payload: { script, moduleUrl } satisfies TempScriptExecutionPayload,
-      });
-
-      if (!response.ok) {
-        throw new Error(response.error ?? 'Script activation failed.');
-      }
-
-      script.status = 'applied';
-      script.updatedAt = Date.now();
-      await saveTemporaryScript(script);
-
-      return {
-        ok: true,
-        payload: { script },
-      } satisfies RuntimeResponse<{ script: TemporaryScript }>;
-    } catch (error) {
-      releaseScriptModule(script.id);
-      script.status = 'failed';
-      script.errorMessage = error instanceof Error ? error.message : String(error);
-      script.updatedAt = Date.now();
-      await saveTemporaryScript(script);
-
+    if (typeof tabId !== 'number') {
       return {
         ok: false,
-        error: script.errorMessage,
+        error: 'No suitable tab found to enable this script. Open a matching page and try again.',
+      } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+    }
+
+    try {
+      const applied = await applyScriptToTab(script, tabId);
+      return {
+        ok: true,
+        payload: { script: applied },
+      } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+    } catch (error) {
+      return {
+        ok: false,
+        error: script.errorMessage ?? (error instanceof Error ? error.message : String(error)),
         payload: { script },
       } satisfies RuntimeResponse<{ script: TemporaryScript }>;
     }
   }
 
-  try {
-    await forwardToTab(tabId, {
-      type: RuntimeMessageType.TempScriptRevoke,
-      payload: { scriptId: payload.scriptId },
-    });
-  } catch (error) {
-    log.debug('Failed to notify content script about script disable.', {
-      tabId,
-      scriptId: payload.scriptId,
-      error: error instanceof Error ? error.message : String(error),
-    });
+  const tabId = typeof payload.tabId === 'number' ? payload.tabId : senderTabId;
+  if (typeof tabId === 'number') {
+    try {
+      await forwardToTab(tabId, {
+        type: RuntimeMessageType.TempScriptRevoke,
+        payload: { scriptId: payload.scriptId },
+      });
+    } catch (error) {
+      log.debug('Failed to notify content script about script disable.', {
+        tabId,
+        scriptId: payload.scriptId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   script.status = 'disabled';
@@ -663,6 +891,121 @@ const handleTempScriptRename = async (
     ok: true,
     payload: { script },
   } satisfies RuntimeResponse<{ script: TemporaryScript }>;
+};
+
+const handleTempScriptUpdate = async (
+  payload: TempScriptUpdatePayload,
+  senderTabId: number | undefined,
+): Promise<RuntimeResponse<{ script: TemporaryScript }>> => {
+  const script = await getTemporaryScript(payload.scriptId);
+  if (!script) {
+    return { ok: false, error: 'Script not found.' } as RuntimeResponse<{ script: TemporaryScript }>;
+  }
+
+  const trimmedName = payload.name?.trim();
+  script.script.jsCode = payload.jsCode;
+  script.script.cssCode = payload.cssCode;
+  script.script.urlMatchPattern = payload.urlMatchPattern?.trim() || undefined;
+  if (payload.selector?.trim()) {
+    script.selector = payload.selector.trim();
+  }
+  if (typeof trimmedName === 'string') {
+    script.name = trimmedName;
+  }
+  script.updatedAt = Date.now();
+
+  // If currently active, re-execute
+  let tabId = typeof payload.tabId === 'number' ? payload.tabId : senderTabId;
+  const isActive = script.status === 'applied' || script.status === 'pending';
+
+  if (isActive) {
+    if (typeof tabId !== 'number') {
+      tabId = await findTabForScript(script);
+    }
+
+    if (typeof tabId !== 'number') {
+      await saveTemporaryScript(script);
+      return {
+        ok: false,
+        error: 'No suitable tab found to re-apply this script. Open a matching page and retry.',
+        payload: { script },
+      } as RuntimeResponse<{ script: TemporaryScript }>;
+    }
+
+    script.status = 'pending';
+    script.errorMessage = undefined;
+    await saveTemporaryScript(script);
+
+    try {
+      const applied = await applyScriptToTab(script, tabId);
+      return { ok: true, payload: { script: applied } } as RuntimeResponse<{ script: TemporaryScript }>;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      script.errorMessage = script.errorMessage ?? reason;
+      log.debug('Script reapply failed.', { scriptId: script.id, tabId, error: reason });
+      return { ok: false, error: script.errorMessage, payload: { script } } as RuntimeResponse<{ script: TemporaryScript }>;
+    }
+  }
+
+  await saveTemporaryScript(script);
+  return { ok: true, payload: { script } } as RuntimeResponse<{ script: TemporaryScript }>;
+};
+
+const applyScriptsForTab = async (tabId: number, tabUrl?: string) => {
+  if (!tabUrl) {
+    return;
+  }
+
+  const scripts = await listTemporaryScripts();
+  const alreadyApplied = tabScriptApplications.get(tabId) ?? new Set<string>();
+
+  for (const script of scripts) {
+    if (script.status === 'disabled' || script.status === 'failed') {
+      continue;
+    }
+
+    if (alreadyApplied.has(script.id)) {
+      continue;
+    }
+
+    const pattern = script.script.urlMatchPattern;
+    let matches = false;
+
+    if (pattern) {
+      try {
+        matches = matchesUrlPattern(pattern, tabUrl);
+      } catch (error) {
+        log.debug('URL pattern evaluation failed during auto-apply.', {
+          scriptId: script.id,
+          pattern,
+          tabUrl,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (!matches && script.context?.url) {
+      try {
+        matches = new URL(script.context.url).origin === new URL(tabUrl).origin;
+      } catch {
+        matches = false;
+      }
+    }
+
+    if (!matches) {
+      continue;
+    }
+
+    try {
+      await applyScriptToTab(script, tabId);
+    } catch (error) {
+      log.warn('Auto-apply failed for script.', {
+        tabId,
+        scriptId: script.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 };
 
 const handleAiGenerate = async (
@@ -920,6 +1263,14 @@ const handleRuntimeMessage = (
       return handleSelectorCaptured(message.payload as CapturedSelectorState, sender.tab?.id);
     case RuntimeMessageType.SelectorGetActive:
       return handleSelectorGetActive(message.payload as SelectorGetActivePayload);
+    case RuntimeMessageType.SelectorSetLevel:
+      return handleSelectorSetLevel(message.payload as SelectorSetLevelPayload, sender.tab?.id);
+    case RuntimeMessageType.SelectorHighlight:
+      return handleSelectorHighlight(message.payload as SelectorHighlightPayload, sender.tab?.id);
+    case RuntimeMessageType.SelectorClearHighlight:
+      return handleSelectorClearHighlight(message.payload as SelectorHighlightPayload, sender.tab?.id);
+    case RuntimeMessageType.GetActiveTab:
+      return handleGetActiveTab();
     case RuntimeMessageType.TempScriptCreate:
       return handleTempScriptCreate(message.payload as TempScriptCreatePayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptList:
@@ -932,6 +1283,8 @@ const handleRuntimeMessage = (
       return handleTempScriptToggle(message.payload as TempScriptTogglePayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptRename:
       return handleTempScriptRename(message.payload as TempScriptRenamePayload, sender.tab?.id);
+    case RuntimeMessageType.TempScriptUpdate:
+      return handleTempScriptUpdate(message.payload as TempScriptUpdatePayload, sender.tab?.id);
     case RuntimeMessageType.TempScriptModuleCreate:
       return Promise.resolve(handleTempScriptModuleCreate(message.payload as TempScriptModuleCreatePayload));
     case RuntimeMessageType.TempScriptModuleRelease:
@@ -961,12 +1314,51 @@ export default defineBackground(() => {
     return undefined;
   });
 
+  browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.status === 'loading') {
+      clearTabApplications(tabId);
+    }
+    if (changeInfo.status === 'complete') {
+      void applyScriptsForTab(tabId, tab.url).catch((error) => {
+        log.debug('Auto-apply skipped.', {
+          tabId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  });
+
   browser.tabs.onRemoved.addListener((tabId) => {
     capturedSelectors.delete(tabId);
     capturingTabs.delete(tabId);
+    clearTabApplications(tabId);
+  });
+
+  browser.windows.onRemoved.addListener((windowId) => {
+    handleWorkspaceWindowRemoved(windowId);
   });
 
   browser.runtime.onSuspend?.addListener(() => {
     capturingTabs.clear();
+    tabScriptApplications.clear();
+    workspaceWindowId = null;
   });
+
+  // Open side panel when action is clicked
+  if (browser.action?.onClicked) {
+    browser.action.onClicked.addListener(async (tab) => {
+      try {
+        await openSidePanel(tab.windowId);
+      } catch (error) {
+        log.warn('Failed to open side panel; falling back to window.', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await openWorkspaceWindow().catch((fallbackError) => {
+          log.error('Failed to open workspace window after side panel failure.', {
+            error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+          });
+        });
+      }
+    });
+  }
 });

@@ -10,10 +10,18 @@ describe('scriptValidator', () => {
     expect(result.errors).toHaveLength(0);
   });
 
-  it('rejects payloads without javascript', () => {
-    const result = validateGeneratedScript({ jsCode: '   ' });
+  it('accepts CSS-only payloads', () => {
+    const result = validateGeneratedScript({ jsCode: '   ', cssCode: '.foo { color: red; }' });
+    expect(result.ok).toBe(true);
+    expect(result.script?.jsCode).toBe('');
+    expect(result.script?.cssCode).toBe('.foo { color: red; }');
+    expect(result.errors).toHaveLength(0);
+  });
+
+  it('rejects payloads without javascript or css', () => {
+    const result = validateGeneratedScript({ jsCode: '   ', cssCode: '   ' });
     expect(result.ok).toBe(false);
-    expect(result.errors[0]).toMatch(/did not include JavaScript/i);
+    expect(result.errors[0]).toMatch(/did not include JavaScript or CSS/i);
   });
 
   it('adds warnings for suspicious patterns and large payloads', () => {

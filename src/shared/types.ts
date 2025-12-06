@@ -1,8 +1,25 @@
+export type SelectorLevel = 'element' | 'class' | 'tag' | 'similar' | 'custom';
+
 export interface SelectorDescriptor {
   id: string;
   selector: string;
   previewText: string;
   framePath?: string[];
+  level: SelectorLevel;
+  matchCount: number;
+  /** Alternative selectors for different levels */
+  alternatives: {
+    element: string;
+    class?: string;
+    tag: string;
+    similar?: string;
+  };
+  /** Raw class list from the element */
+  classList: string[];
+  /** Currently applied class filters when using class scope */
+  selectedClasses?: string[];
+  /** Tag name */
+  tagName: string;
 }
 
 export interface PageContextSnapshot {
